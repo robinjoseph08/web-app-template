@@ -7,7 +7,7 @@ COPY go.mod go.sum tygo.yaml ./
 COPY pkg ./pkg
 RUN tygo generate
 
-FROM node:26.8.1-alpine@sha256:2d984a15c9b54fd0aeb608b8e0d0d83529eb34d2966db27a1fb4f1edc3d298a3 AS frontend
+FROM node:26.11.1-alpine@sha256:143494b1da2945f061539253adc65e4f1569ddf07da2d384c022c791a9d90a4a AS frontend
 WORKDIR /src
 RUN npm install --global pnpm@11.25.0
 COPY package.json pnpm-lock.yaml ./
