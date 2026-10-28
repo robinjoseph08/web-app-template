@@ -4,6 +4,36 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Web App Template</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <!-- The browser's toolbar on phones, switched with the theme by the
+         script below and app/theme. -->
+    <meta
+      name="theme-color"
+      content="#f1f5f9"
+      data-light="#f1f5f9"
+      data-dark="#020617"
+    />
+    <script>
+      // The theme is applied before the page draws, so it doesn't flash light
+      // first: the visitor's choice if they've made one, otherwise their
+      // device's. Keep this in step with app/theme/theme.ts.
+      (function () {
+        var theme = null;
+        try {
+          theme = localStorage.getItem("theme");
+        } catch (e) {}
+        if (theme !== "light" && theme !== "dark") {
+          theme = matchMedia("(prefers-color-scheme: dark)").matches
+            ? "dark"
+            : "light";
+        }
+        if (theme === "dark") {
+          document.documentElement.classList.add("dark");
+        }
+        var meta = document.querySelector('meta[name="theme-color"]');
+        meta.setAttribute("content", meta.dataset[theme]);
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

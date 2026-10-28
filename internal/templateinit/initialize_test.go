@@ -40,6 +40,21 @@ func TestInitializeReplacesTemplateIdentity(t *testing.T) {
 	assert.NotContains(t, mustRead(t, root, "README.md"), "Template instructions")
 }
 
+func TestInitializeSortsImportsAfterTheModuleChanges(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	runGit(t, root, "init", "--quiet")
+	templateModule := "github.com/robinjoseph08/" + "web-app-template"
+	writeFile(t, root, "go.mod", "module "+templateModule+"\n")
+	writeFile(t, root, "main.go", "package main\n\nimport (\n\t\"github.com/labstack/echo/v5\"\n\t\""+templateModule+"/pkg/config\"\n)\n\nvar _ = echo.New\nvar _ = config.New\n")
+	runGit(t, root, "add", ".")
+
+	_, err := Initialize(root, "github.com/example/order-console")
+	require.NoError(t, err)
+	assert.Contains(t, mustRead(t, root, "main.go"), "import (\n\t\"github.com/example/order-console/pkg/config\"\n\t\"github.com/labstack/echo/v5\"\n)")
+}
+
 func TestInitializeRemovesTemplateOnlyFilesAndTask(t *testing.T) {
 	t.Parallel()
 

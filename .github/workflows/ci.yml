@@ -6,6 +6,9 @@ on:
   pull_request:
   workflow_call:
 
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -14,18 +17,54 @@ jobs:
   go:
     name: Go
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:17.6-alpine3.22@sha256:ef257d85f76e48da1c64832459b59fcaba1a4dac97bf5d7450c77753542eee94
+        env:
+          POSTGRES_DB: web_app_template_test
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d web_app_template_test"
+          --health-interval 1s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      # Points the Go tests at the service above instead of the Docker
+      # container the dev launcher would otherwise start.
+      TEST_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/web_app_template_test?sslmode=disable
     steps:
       - uses: actions/checkout@v7
       - uses: jdx/mise-action@v4
+        with:
+          install_args: go github:golangci/golangci-lint
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+            tmp/golangci-lint-cache
+          key: go-${{ env.ImageOS }}-${{ hashFiles('mise.toml', 'go.sum') }}
+          restore-keys: go-${{ env.ImageOS }}-
       - run: mise lint:go
       - run: mise test:race
 
   javascript:
     name: JavaScript
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
       - uses: jdx/mise-action@v4
+        with:
+          install_args: go node npm:pnpm github:gzuidhof/tygo
+      - uses: actions/cache@v6
+        with:
+          path: node_modules
+          key: node-modules-${{ env.ImageOS }}-${{ hashFiles('mise.toml', 'pnpm-lock.yaml') }}
       - run: pnpm install --frozen-lockfile
       - run: mise tygo
       - run: mise lint:js
@@ -33,36 +72,93 @@ jobs:
 
   browsers:
     name: Browsers
-    runs-on: ubuntu-latest
+    # Not ubuntu-latest: Playwright's WebKit is built against Ubuntu 24.04's
+    # libraries and can't start on newer releases until Playwright supports
+    # them.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
       - uses: jdx/mise-action@v4
-      - run: pnpm install --frozen-lockfile
+        with:
+          install_args: go node npm:pnpm github:gzuidhof/tygo
+      - uses: actions/cache@v6
+        with:
+          path: node_modules
+          key: node-modules-${{ env.ImageOS }}-${{ hashFiles('mise.toml', 'pnpm-lock.yaml') }}
+      # Its own key, since this job builds ./cmd/api and ./cmd/dev, which the
+      # Go job's cache doesn't hold.
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: go-e2e-${{ env.ImageOS }}-${{ hashFiles('mise.toml', 'go.sum') }}
+          restore-keys: go-e2e-${{ env.ImageOS }}-
 
-      - name: Read Playwright version
-        id: playwright
-        run: echo "version=$(pnpm exec playwright --version | awk '{print $NF}')" >> "$GITHUB_OUTPUT"
+      - name: Install dependencies
+        run: |
+          pnpm install --frozen-lockfile
+          echo "PLAYWRIGHT_VERSION=$(node -p "require('@playwright/test/package.json').version")" >> "$GITHUB_ENV"
+          echo "UBUNTU=$(. /etc/os-release && echo "$VERSION_ID")" >> "$GITHUB_ENV"
+          echo "MONTH=$(date +%Y-%m)" >> "$GITHUB_ENV"
 
-      - name: Cache Playwright browsers
-        id: browser-cache
-        uses: actions/cache@v6
+      # The browsers only change with the Playwright version.
+      - uses: actions/cache@v6
+        id: browsers
         with:
           path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}-${{ steps.playwright.outputs.version }}
+          key: playwright-${{ runner.os }}-${{ env.PLAYWRIGHT_VERSION }}
 
+      # The system libraries the browsers need, as the packages apt downloads.
+      # Getting them from Azure's Ubuntu mirror sometimes takes longer than
+      # the whole job may, so they're kept between runs. A cache can't be
+      # updated once saved, so a new one starts each month from the last,
+      # adding the packages Ubuntu has updated since.
+      - uses: actions/cache@v6
+        with:
+          path: ~/apt-archives
+          key: apt-ubuntu-${{ env.UBUNTU }}-playwright-${{ env.PLAYWRIGHT_VERSION }}-${{ env.MONTH }}
+          restore-keys: |
+            apt-ubuntu-${{ env.UBUNTU }}-playwright-${{ env.PLAYWRIGHT_VERSION }}-
+            apt-ubuntu-${{ env.UBUNTU }}-
+
+      # The browser cache only holds the browsers, so the system libraries are
+      # installed either way, from the packages above when they're there. apt
+      # downloads as root into the cached folder (its own user can't write to
+      # the home directory). Afterwards, versions Ubuntu has replaced are
+      # cleared out, and the folder is handed back for the cache to save.
       - name: Install browsers
-        if: steps.browser-cache.outputs.cache-hit != 'true'
-        run: pnpm exec playwright install --with-deps chromium firefox
+        run: |
+          mkdir -p ~/apt-archives/partial
+          printf 'Dir::Cache::Archives "%s";\nAPT::Sandbox::User "root";\n' "$HOME/apt-archives" |
+            sudo tee /etc/apt/apt.conf.d/99-cached-archives
+          if [ "${{ steps.browsers.outputs.cache-hit }}" = "true" ]; then
+            pnpm exec playwright install-deps chromium firefox webkit
+          else
+            pnpm exec playwright install --with-deps chromium firefox webkit
+          fi
+          sudo apt-get autoclean
+          sudo chown -R "$(id -u):$(id -g)" ~/apt-archives
 
-      - name: Install browser system dependencies
-        if: steps.browser-cache.outputs.cache-hit == 'true'
-        run: pnpm exec playwright install-deps chromium firefox
-
+      # The dev launcher starts PostgreSQL in Docker, the same as locally.
       - run: mise test:e2e
+
+      - name: Upload the report
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-report
+          path: |
+            playwright-report/
+            test-results/
+            build/e2e/server.log
+          retention-days: 14
 
   production:
     name: Production
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     services:
       postgres:
         image: postgres:17.6-alpine3.22@sha256:ef257d85f76e48da1c64832459b59fcaba1a4dac97bf5d7450c77753542eee94
@@ -80,6 +176,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: jdx/mise-action@v4
+        with:
+          install_args: go node npm:pnpm github:gzuidhof/tygo
+      - uses: actions/cache@v6
+        with:
+          path: node_modules
+          key: node-modules-${{ env.ImageOS }}-${{ hashFiles('mise.toml', 'pnpm-lock.yaml') }}
       - run: pnpm install --frozen-lockfile
       - run: mise build
       - run: mise docker
@@ -92,7 +194,7 @@ jobs:
             "$image_name:latest")
           trap 'docker rm --force "$container" >/dev/null 2>&1 || true' EXIT
           for attempt in $(seq 1 30); do
-            if curl --fail --silent http://127.0.0.1:8080/health >/dev/null; then
+            if curl --fail --silent http://127.0.0.1:3579/health >/dev/null; then
               break
             fi
             if [[ "$attempt" == 30 ]]; then
@@ -101,10 +203,11 @@ jobs:
             fi
             sleep 1
           done
-          curl --fail --silent http://127.0.0.1:8080/ >/dev/null
-          curl --fail --silent http://127.0.0.1:8080/settings/profile | grep --quiet '<div id="root"></div>'
-          asset_status=$(curl --silent --output /dev/null --write-out '%{http_code}' http://127.0.0.1:8080/assets/missing.js)
-          api_status=$(curl --silent --output /tmp/api-missing --write-out '%{http_code}' http://127.0.0.1:8080/api/missing)
+          curl --fail --silent http://127.0.0.1:3579/ >/dev/null
+          curl --fail --silent http://127.0.0.1:3579/settings/profile | grep --quiet '<div id="root"></div>'
+          curl --fail --silent http://127.0.0.1:3579/api/version | grep --quiet '"version"'
+          asset_status=$(curl --silent --output /dev/null --write-out '%{http_code}' http://127.0.0.1:3579/assets/missing.js)
+          api_status=$(curl --silent --output /tmp/api-missing --write-out '%{http_code}' http://127.0.0.1:3579/api/missing)
           test "$asset_status" = 404
           test "$api_status" = 404
           grep --quiet 'not_found' /tmp/api-missing

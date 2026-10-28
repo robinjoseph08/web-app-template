@@ -1,27 +1,26 @@
 import { defineConfig, devices } from "@playwright/test";
 
-const webPort = Number(process.env.WEB_PORT ?? 5173);
-const baseURL = `http://127.0.0.1:${webPort}`;
+// The dev launcher (mise test:e2e) builds the production binary, serves it
+// against a freshly migrated database, and passes its address here.
+const baseURL = process.env.E2E_BASE_URL;
+if (!baseURL) {
+  throw new Error(
+    "E2E_BASE_URL is not set. Run the tests with mise test:e2e, which starts the server.",
+  );
+}
 
 export default defineConfig({
+  forbidOnly: Boolean(process.env.CI),
+  fullyParallel: true,
   projects: [
-    {
-      name: "chromium",
-      use: { ...devices["Desktop Chrome"] },
-    },
-    {
-      name: "firefox",
-      use: { ...devices["Desktop Firefox"] },
-    },
+    { name: "chromium", use: { ...devices["Desktop Chrome"] } },
+    { name: "firefox", use: { ...devices["Desktop Firefox"] } },
+    { name: "webkit", use: { ...devices["Desktop Safari"] } },
   ],
+  reporter: process.env.CI
+    ? [["github"], ["list"], ["html", { open: "never" }]]
+    : "list",
+  retries: process.env.CI ? 1 : 0,
   testDir: "./e2e",
-  use: {
-    baseURL,
-    trace: "on-first-retry",
-  },
-  webServer: {
-    command: `pnpm start --port ${webPort}`,
-    reuseExistingServer: false,
-    url: baseURL,
-  },
+  use: { baseURL, trace: "retain-on-failure" },
 });

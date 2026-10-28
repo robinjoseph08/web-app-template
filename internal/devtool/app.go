@@ -1,3 +1,6 @@
+// Package devtool implements the local development commands behind the mise
+// tasks: a shared PostgreSQL container with a database per worktree, and dev
+// servers on ports that don't collide between worktrees.
 package devtool
 
 import (
@@ -8,95 +11,59 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 )
 
 const (
 	defaultAPIPort = 3579
 	defaultWebPort = 5173
+	// The e2e server starts from its own port, so a running dev API keeps its
+	// usual one.
+	defaultE2EPort = 4579
+
+	startAll = "all"
+	startAir = "air"
+	startAPI = "api"
+	startWeb = "web"
+
+	// testDatabaseURLEnv points the Go tests at an existing database, as CI
+	// does, instead of the shared Docker container.
+	testDatabaseURLEnv = "TEST_DATABASE_URL"
+
+	// e2eAll runs every browser in playwright.config.ts.
+	e2eAll = "all"
 )
 
-// Environment describes the repository and worktree resources used by a command.
-type Environment struct {
-	MainRoot        string
-	CurrentRoot     string
-	MainDatabase    string
-	CurrentDatabase string
-	PostgresPort    int
-	ProjectName     string
-}
+// e2eBrowsers are the Playwright projects in playwright.config.ts.
+var e2eBrowsers = []string{"chromium", "firefox", "webkit"}
 
-func (e Environment) IsMain() bool {
-	return samePath(e.MainRoot, e.CurrentRoot)
-}
-
-func (e Environment) MainFilesPath() string {
-	return filepath.Join(e.MainRoot, "tmp", "files")
-}
-
-func (e Environment) CurrentFilesPath() string {
-	return filepath.Join(e.CurrentRoot, "tmp", "files")
-}
-
-func (e Environment) DatabaseURL(name string) string {
-	return fmt.Sprintf("postgres://postgres:postgres@127.0.0.1:%d/%s?sslmode=disable", e.PostgresPort, name)
-}
-
-// DatabaseCloneResult reports whether a clone installed the replacement before
-// returning an error during cleanup.
-type DatabaseCloneResult struct {
-	Replaced bool
-}
-
-// DatabaseManager owns the shared PostgreSQL process and its worktree databases.
-type DatabaseManager interface {
-	Start(context.Context, Environment) error
-	RequireRunning(context.Context, Environment) error
-	Exists(context.Context, Environment, string) (bool, error)
-	Create(context.Context, Environment, string) error
-	Clone(context.Context, Environment, string, string) (DatabaseCloneResult, error)
-	Reset(context.Context, Environment, string) error
-	Migrate(context.Context, Environment, string) error
-	Rollback(context.Context, Environment, string) error
-}
-
-// PortLease reserves a runtime port until Close is called.
-type PortLease interface {
-	Port() int
-	Close() error
-}
-
-// PortAllocator reserves the first available port at or above a preferred port.
-type PortAllocator interface {
-	Acquire(preferred int) (PortLease, error)
-}
-
-// ProcessManager runs the development servers and browser tests.
-type ProcessManager interface {
-	Start(context.Context, Environment, string, int, int) error
-	E2E(context.Context, Environment, string, int) error
-}
+// defaultTestArgs match mise test:go, which explains -parallel 4.
+var defaultTestArgs = []string{"./...", "-parallel", "4", "-coverprofile", "coverage.out"}
 
 // App implements the command interface used by mise tasks.
 type App struct {
 	Stdin     io.Reader
 	Stdout    io.Writer
-	Stderr    io.Writer
 	Resolve   func(context.Context) (Environment, error)
 	Database  DatabaseManager
-	Ports     PortAllocator
+	Ports     func(Environment) PortAllocator
 	Processes ProcessManager
+	Getenv    func(string) string
 }
 
 func NewApp() *App {
 	return &App{
-		Stdin:     os.Stdin,
-		Stdout:    os.Stdout,
-		Stderr:    os.Stderr,
-		Resolve:   ResolveEnvironment,
-		Database:  &DockerDatabase{},
-		Ports:     &FilePortAllocator{},
+		Stdin:    os.Stdin,
+		Stdout:   os.Stdout,
+		Resolve:  ResolveEnvironment,
+		Database: &DockerDatabase{Stdout: os.Stdout},
+		Ports: func(env Environment) PortAllocator {
+			return &FilePortAllocator{LockRoot: portLockRoot(env), Owner: env.CurrentRoot}
+		},
 		Processes: &OSProcesses{},
+		Getenv:    os.Getenv,
 	}
 }
 
@@ -113,12 +80,16 @@ func (a *App) Run(ctx context.Context, args []string) error {
 	switch args[0] {
 	case "setup":
 		return a.setup(ctx, env)
-	case "clone":
-		return a.clone(ctx, env, args[1:])
-	case "db":
-		return a.database(ctx, env, args[1:])
 	case "start":
 		return a.start(ctx, env, args[1:])
+	case "db":
+		return a.database(ctx, env, args[1:])
+	case "clone":
+		return a.clone(ctx, env, args[1:])
+	case "test":
+		return a.test(ctx, env, args[1:])
+	case "psql":
+		return a.psql(ctx, env, args[1:])
 	case "e2e":
 		return a.e2e(ctx, env, args[1:])
 	default:
@@ -127,198 +98,111 @@ func (a *App) Run(ctx context.Context, args []string) error {
 }
 
 func (a *App) setup(ctx context.Context, env Environment) error {
-	if err := os.MkdirAll(env.CurrentFilesPath(), 0o755); err != nil {
-		return fmt.Errorf("create files directory: %w", err)
-	}
-
-	if env.IsMain() {
-		if err := a.Database.Start(ctx, env); err != nil {
-			return err
-		}
-		exists, err := a.Database.Exists(ctx, env, env.MainDatabase)
-		if err != nil {
-			return err
-		}
-		if !exists {
-			if err := a.Database.Create(ctx, env, env.MainDatabase); err != nil {
-				return err
-			}
-		}
-		if err := a.Database.Migrate(ctx, env, env.MainDatabase); err != nil {
-			return err
-		}
-		return a.printf("Main worktree is ready with database %s.\n", env.MainDatabase)
-	}
-
-	if err := a.Database.RequireRunning(ctx, env); err != nil {
-		return err
-	}
-	exists, err := a.Database.Exists(ctx, env, env.CurrentDatabase)
+	port, err := a.Database.Ensure(ctx, env)
 	if err != nil {
 		return err
 	}
-	if !exists {
-		mainExists, err := a.Database.Exists(ctx, env, env.MainDatabase)
+	if err := a.ensureDevelopmentDatabase(ctx, env); err != nil {
+		return err
+	}
+	if err := a.createIfMissing(ctx, env, env.TestDatabase()); err != nil {
+		return err
+	}
+	return a.printf("Ready. Databases %s and %s are on PostgreSQL port %d.\n", env.CurrentDatabase, env.TestDatabase(), port)
+}
+
+func (a *App) start(ctx context.Context, env Environment, args []string) error {
+	mode := startAll
+	if len(args) > 1 {
+		return errors.New("start accepts at most one mode")
+	}
+	if len(args) == 1 {
+		mode = args[0]
+	}
+	switch mode {
+	case startAll, startAir, startAPI, startWeb:
+	default:
+		return fmt.Errorf("unknown start mode %q", mode)
+	}
+
+	servers := Servers{CookieNamespace: env.CookieNamespace()}
+	runsAPI := mode != startWeb
+	runsWeb := mode == startAll || mode == startWeb
+	ports := a.Ports(env)
+
+	if runsAPI {
+		port, err := a.Database.Ensure(ctx, env)
 		if err != nil {
 			return err
 		}
-		if !mainExists {
-			return fmt.Errorf("main database %s does not exist; run mise setup in %s", env.MainDatabase, env.MainRoot)
+		if err := a.ensureDevelopmentDatabase(ctx, env); err != nil {
+			return err
 		}
-		nonempty, err := directoryNonempty(env.CurrentFilesPath())
+		servers.DatabaseURL = DatabaseURL(port, env.CurrentDatabase)
+
+		lease, err := ports.Acquire(defaultAPIPort)
+		if err != nil {
+			return fmt.Errorf("reserve API port: %w", err)
+		}
+		defer func() { _ = lease.Close() }()
+		servers.APIPort = lease.Port()
+		servers.APIURL = serverURL(servers.APIPort)
+		forget, err := recordAPIPort(env, servers.APIPort)
 		if err != nil {
 			return err
 		}
-		if nonempty {
-			confirmed, err := a.confirm(fmt.Sprintf("Database %s is missing. Replace this worktree's existing files from main?", env.CurrentDatabase))
+		defer forget()
+	}
+
+	if runsWeb {
+		if !runsAPI {
+			// The frontend alone talks to the API this worktree is already
+			// running. Guessing a port could reach another worktree's API,
+			// and with it that worktree's database.
+			port, err := recordedAPIPort(env)
 			if err != nil {
 				return err
 			}
-			if !confirmed {
-				return a.printf("Setup cancelled.\n")
+			if port == 0 {
+				return errors.New("no API is running in this worktree; start one with mise start:air, or run both with mise start")
 			}
+			servers.APIURL = serverURL(port)
 		}
-		stagedFiles, err := stageDirectory(env.MainFilesPath(), env.CurrentFilesPath())
+		lease, err := ports.Acquire(defaultWebPort)
 		if err != nil {
-			return fmt.Errorf("stage main files: %w", err)
+			return fmt.Errorf("reserve web port: %w", err)
 		}
-		defer stagedFiles.Cleanup()
-		if err := stagedFiles.Install(); err != nil {
-			return fmt.Errorf("install main files: %w", err)
-		}
-		cloneResult, cloneErr := a.Database.Clone(ctx, env, env.MainDatabase, env.CurrentDatabase)
-		if cloneErr != nil {
-			if cloneResult.Replaced {
-				return errors.Join(fmt.Errorf("clone main database: %w", cloneErr), stagedFiles.Finalize())
-			}
-			return errors.Join(fmt.Errorf("clone main database: %w", cloneErr), stagedFiles.Rollback())
-		}
-		if err := stagedFiles.Finalize(); err != nil {
-			return fmt.Errorf("finalize main files: %w", err)
-		}
-	}
-	if err := a.Database.Migrate(ctx, env, env.CurrentDatabase); err != nil {
-		return err
-	}
-	return a.printf("Worktree is ready with database %s.\n", env.CurrentDatabase)
-}
-
-func (a *App) clone(ctx context.Context, env Environment, args []string) error {
-	kind := "all"
-	toMain := false
-	for _, arg := range args {
-		switch arg {
-		case "db", "files":
-			if kind != "all" {
-				return errors.New("only one clone resource may be specified")
-			}
-			kind = arg
-		case "--to-main":
-			toMain = true
-		default:
-			return fmt.Errorf("unknown clone argument %q", arg)
-		}
-	}
-	if env.IsMain() {
-		return errors.New("clone commands must be run from a linked worktree")
-	}
-	if kind != "files" {
-		if err := a.Database.RequireRunning(ctx, env); err != nil {
-			return err
-		}
+		defer func() { _ = lease.Close() }()
+		servers.WebPort = lease.Port()
 	}
 
-	sourceDatabase, targetDatabase := env.MainDatabase, env.CurrentDatabase
-	sourceFiles, targetFiles := env.MainFilesPath(), env.CurrentFilesPath()
-	if toMain {
-		sourceDatabase, targetDatabase = targetDatabase, sourceDatabase
-		sourceFiles, targetFiles = targetFiles, sourceFiles
-	}
-
-	replaceDatabase := kind == "all" || kind == "db"
-	replaceFiles := kind == "all" || kind == "files"
-	needsConfirmation := toMain
-	if replaceDatabase {
-		sourceExists, err := a.Database.Exists(ctx, env, sourceDatabase)
-		if err != nil {
-			return err
-		}
-		if !sourceExists {
-			return fmt.Errorf("source database %s does not exist", sourceDatabase)
-		}
-		targetExists, err := a.Database.Exists(ctx, env, targetDatabase)
-		if err != nil {
-			return err
-		}
-		needsConfirmation = targetExists
-	}
-	if replaceFiles {
-		if _, err := os.Stat(sourceFiles); err != nil {
-			return fmt.Errorf("read source files %s: %w", sourceFiles, err)
-		}
-		nonempty, err := directoryNonempty(targetFiles)
-		if err != nil {
-			return err
-		}
-		needsConfirmation = needsConfirmation || nonempty
-	}
-
-	if needsConfirmation {
-		message := fmt.Sprintf("Replace %s data with data from %s?", targetLabel(env, toMain), sourceLabel(env, toMain))
-		confirmed, err := a.confirm(message)
-		if err != nil {
-			return err
-		}
-		if !confirmed {
-			return a.printf("Clone cancelled.\n")
-		}
-	}
-
-	var stagedFiles *stagedDirectory
-	if replaceFiles {
-		var err error
-		stagedFiles, err = stageDirectory(sourceFiles, targetFiles)
-		if err != nil {
-			return err
-		}
-		defer stagedFiles.Cleanup()
-	}
-	if stagedFiles != nil {
-		if err := stagedFiles.Install(); err != nil {
+	if runsAPI {
+		if err := a.printf("Database: %s\nAPI: http://localhost:%d\n", env.CurrentDatabase, servers.APIPort); err != nil {
 			return err
 		}
 	}
-	if replaceDatabase {
-		cloneResult, cloneErr := a.Database.Clone(ctx, env, sourceDatabase, targetDatabase)
-		if cloneErr != nil {
-			if stagedFiles == nil {
-				return cloneErr
-			}
-			if cloneResult.Replaced {
-				return errors.Join(cloneErr, stagedFiles.Finalize())
-			}
-			return errors.Join(cloneErr, stagedFiles.Rollback())
-		}
-	}
-	if stagedFiles != nil {
-		if err := stagedFiles.Finalize(); err != nil {
+	if runsWeb {
+		if err := a.printf("Web: http://localhost:%d (API: %s)\n", servers.WebPort, servers.APIURL); err != nil {
 			return err
 		}
 	}
-	return a.printf("Cloned %s from %s to %s.\n", kind, sourceLabel(env, toMain), targetLabel(env, toMain))
+	return a.Processes.Start(ctx, env, mode, servers)
 }
 
 func (a *App) database(ctx context.Context, env Environment, args []string) error {
 	if len(args) != 1 {
-		return errors.New("database command must be migrate, reset, or rollback")
+		return errors.New("database command must be migrate, rollback, reset, or stop")
 	}
-	if err := a.Database.RequireRunning(ctx, env); err != nil {
+	if args[0] == "stop" {
+		return a.Database.Stop(ctx, env)
+	}
+	if _, err := a.Database.Ensure(ctx, env); err != nil {
 		return err
 	}
 
 	switch args[0] {
 	case "migrate":
-		return a.Database.Migrate(ctx, env, env.CurrentDatabase)
+		return a.ensureDevelopmentDatabase(ctx, env)
 	case "rollback":
 		return a.Database.Rollback(ctx, env, env.CurrentDatabase)
 	case "reset":
@@ -327,7 +211,7 @@ func (a *App) database(ctx context.Context, env Environment, args []string) erro
 			return err
 		}
 		if exists {
-			confirmed, err := a.confirm(fmt.Sprintf("Reset database %s and delete all of its data?", env.CurrentDatabase))
+			confirmed, err := a.confirm(ctx, fmt.Sprintf("Reset database %s and delete all of its data?", env.CurrentDatabase))
 			if err != nil {
 				return err
 			}
@@ -344,89 +228,279 @@ func (a *App) database(ctx context.Context, env Environment, args []string) erro
 	}
 }
 
-func (a *App) start(ctx context.Context, env Environment, args []string) error {
-	mode := "all"
-	if len(args) > 1 {
-		return errors.New("start accepts at most one mode")
-	}
-	if len(args) == 1 {
-		mode = args[0]
-	}
-	if mode != "all" && mode != "air" && mode != "api" && mode != "web" {
-		return fmt.Errorf("unknown start mode %q", mode)
-	}
-	if mode != "web" {
-		if err := a.Database.RequireRunning(ctx, env); err != nil {
-			return err
+func (a *App) clone(ctx context.Context, env Environment, args []string) error {
+	toMain := false
+	for _, arg := range args {
+		if arg != "--to-main" {
+			return fmt.Errorf("unknown clone argument %q", arg)
 		}
+		toMain = true
 	}
-
-	var apiLease, webLease PortLease
-	var err error
-	if mode != "web" {
-		apiLease, err = a.Ports.Acquire(defaultAPIPort)
-		if err != nil {
-			return fmt.Errorf("reserve API port: %w", err)
-		}
-		defer func() { _ = apiLease.Close() }()
+	if env.IsMain() {
+		return errors.New("clone must be run from a linked worktree")
 	}
-	if mode == "all" || mode == "web" {
-		webLease, err = a.Ports.Acquire(defaultWebPort)
-		if err != nil {
-			return fmt.Errorf("reserve web port: %w", err)
-		}
-		defer func() { _ = webLease.Close() }()
-	}
-
-	apiPort, webPort := 0, 0
-	if apiLease != nil {
-		apiPort = apiLease.Port()
-	}
-	if webLease != nil {
-		webPort = webLease.Port()
-	}
-	if err := a.printf("Database: %s\n", env.CurrentDatabase); err != nil {
+	if _, err := a.Database.Ensure(ctx, env); err != nil {
 		return err
 	}
-	if apiPort != 0 {
-		if err := a.printf("API: http://127.0.0.1:%d\n", apiPort); err != nil {
+
+	source, target := env.MainDatabase, env.CurrentDatabase
+	sourceLabel, targetLabel := "main", filepath.Base(env.CurrentRoot)
+	if toMain {
+		source, target = target, source
+		sourceLabel, targetLabel = targetLabel, sourceLabel
+	}
+	sourceExists, err := a.Database.Exists(ctx, env, source)
+	if err != nil {
+		return err
+	}
+	if !sourceExists {
+		return fmt.Errorf("source database %s does not exist", source)
+	}
+	targetExists, err := a.Database.Exists(ctx, env, target)
+	if err != nil {
+		return err
+	}
+	if targetExists {
+		confirmed, err := a.confirm(ctx, fmt.Sprintf("Replace %s data with data from %s?", targetLabel, sourceLabel))
+		if err != nil {
 			return err
 		}
-	}
-	if webPort != 0 {
-		if err := a.printf("Web: http://127.0.0.1:%d\n", webPort); err != nil {
-			return err
+		if !confirmed {
+			return a.printf("Clone cancelled.\n")
 		}
 	}
-	return a.Processes.Start(ctx, env, mode, apiPort, webPort)
+	if err := a.Database.Clone(ctx, env, source, target); err != nil {
+		return err
+	}
+	return a.printf("Cloned database from %s to %s.\n", sourceLabel, targetLabel)
 }
 
-func (a *App) e2e(ctx context.Context, env Environment, args []string) error {
-	project := ""
-	if len(args) > 1 {
-		return errors.New("e2e accepts at most one project")
+// test runs the Go tests against this worktree's test database, or against
+// the one TEST_DATABASE_URL names when that's set, as in CI.
+func (a *App) test(ctx context.Context, env Environment, args []string) error {
+	if len(args) == 0 {
+		args = defaultTestArgs
 	}
-	if len(args) == 1 {
-		project = args[0]
+	if url := a.Getenv(testDatabaseURLEnv); url != "" {
+		return a.Processes.Test(ctx, env, url, args...)
 	}
-	lease, err := a.Ports.Acquire(defaultWebPort)
+	port, err := a.Database.Ensure(ctx, env)
 	if err != nil {
-		return fmt.Errorf("reserve web port: %w", err)
+		return err
+	}
+	if err := a.createIfMissing(ctx, env, env.TestDatabase()); err != nil {
+		return err
+	}
+	return a.Processes.Test(ctx, env, DatabaseURL(port, env.TestDatabase()), args...)
+}
+
+func (a *App) psql(ctx context.Context, env Environment, args []string) error {
+	test := false
+	for _, arg := range args {
+		if arg != "--test" {
+			return fmt.Errorf("unknown psql argument %q", arg)
+		}
+		test = true
+	}
+	if _, err := a.Database.Ensure(ctx, env); err != nil {
+		return err
+	}
+	// Only a database this creates gets set up, so psql shows an existing
+	// database as it is, for example right after a rollback.
+	if test {
+		if err := a.createIfMissing(ctx, env, env.TestDatabase()); err != nil {
+			return err
+		}
+		return a.Database.Psql(ctx, env, env.TestDatabase())
+	}
+	exists, err := a.Database.Exists(ctx, env, env.CurrentDatabase)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		if err := a.ensureDevelopmentDatabase(ctx, env); err != nil {
+			return err
+		}
+	}
+	return a.Database.Psql(ctx, env, env.CurrentDatabase)
+}
+
+// e2e runs the Playwright tests against the production build of the site,
+// served by the binary, the way it's deployed. The binary uses its own
+// database, rebuilt on every run, so tests start from the same state and never
+// touch the development database. An optional browser comes first; any other
+// arguments go to Playwright, like a spec file or --headed.
+func (a *App) e2e(ctx context.Context, env Environment, args []string) error {
+	var playwrightArgs []string
+	if len(args) > 0 && (args[0] == e2eAll || slices.Contains(e2eBrowsers, args[0])) {
+		if args[0] != e2eAll {
+			playwrightArgs = append(playwrightArgs, "--project="+args[0])
+		}
+		args = args[1:]
+	}
+	playwrightArgs = append(playwrightArgs, args...)
+
+	// A second run in this worktree would rebuild the database and the
+	// frontend under the first.
+	unlock, err := lockFile(ctx, filepath.Join(env.CurrentRoot, "tmp", "e2e.lock"), func() {
+		_ = a.printf("Waiting for another e2e run in this worktree to finish...\n")
+	})
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	port, err := a.Database.Ensure(ctx, env)
+	if err != nil {
+		return err
+	}
+	name := env.E2EDatabase()
+	if err := a.printf("Rebuilding database %s...\n", name); err != nil {
+		return err
+	}
+	if err := a.Database.Reset(ctx, env, name); err != nil {
+		return err
+	}
+	if err := a.Database.Migrate(ctx, env, name); err != nil {
+		return err
+	}
+
+	lease, err := a.Ports(env).Acquire(defaultE2EPort)
+	if err != nil {
+		return fmt.Errorf("reserve e2e server port: %w", err)
 	}
 	defer func() { _ = lease.Close() }()
-	return a.Processes.E2E(ctx, env, project, lease.Port())
+	logPath, err := filepath.Rel(env.CurrentRoot, e2eServerLog(env))
+	if err != nil {
+		return err
+	}
+	if err := a.printf("E2E server: %s (log in %s)\n", serverURL(lease.Port()), logPath); err != nil {
+		return err
+	}
+	return a.Processes.E2E(ctx, env, DatabaseURL(port, name), lease.Port(), playwrightArgs...)
 }
 
-func (a *App) confirm(message string) (bool, error) {
+// ensureDevelopmentDatabase creates this worktree's database if needed, copied
+// from the main worktree's when that exists, and brings it up to date.
+func (a *App) ensureDevelopmentDatabase(ctx context.Context, env Environment) error {
+	// Two commands setting up the same new database at once would both clone
+	// it, and the second would drop the first's copy from under it.
+	unlock, err := lockFile(ctx, filepath.Join(env.CurrentRoot, "tmp", "database-setup.lock"), func() {
+		_ = a.printf("Waiting for another command in this worktree to set up %s...\n", env.CurrentDatabase)
+	})
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	exists, err := a.Database.Exists(ctx, env, env.CurrentDatabase)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		mainExists := false
+		if !env.IsMain() {
+			if mainExists, err = a.Database.Exists(ctx, env, env.MainDatabase); err != nil {
+				return err
+			}
+		}
+		if mainExists {
+			if err := a.printf("Copying the main worktree's database into %s...\n", env.CurrentDatabase); err != nil {
+				return err
+			}
+			if err := a.Database.Clone(ctx, env, env.MainDatabase, env.CurrentDatabase); err != nil {
+				return fmt.Errorf("clone main database: %w", err)
+			}
+		} else if err := a.Database.Create(ctx, env, env.CurrentDatabase); err != nil {
+			return err
+		}
+	}
+	return a.Database.Migrate(ctx, env, env.CurrentDatabase)
+}
+
+// createIfMissing creates an empty database if it doesn't exist yet.
+func (a *App) createIfMissing(ctx context.Context, env Environment, name string) error {
+	exists, err := a.Database.Exists(ctx, env, name)
+	if err != nil || exists {
+		return err
+	}
+	return a.Database.Create(ctx, env, name)
+}
+
+func apiPortPath(env Environment) string {
+	return filepath.Join(env.CurrentRoot, "tmp", "api-port")
+}
+
+// recordAPIPort leaves this worktree's API port where a separately started
+// frontend can find it. Ports are chosen at start, so there is nowhere else to
+// look it up.
+func recordAPIPort(env Environment, port int) (func(), error) {
+	path := apiPortPath(env)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, fmt.Errorf("create %s: %w", filepath.Dir(path), err)
+	}
+	if err := os.WriteFile(path, []byte(strconv.Itoa(port)), 0o600); err != nil {
+		return nil, fmt.Errorf("record API port: %w", err)
+	}
+	// A second API in this worktree may have recorded its own port since, so
+	// only this one's is removed.
+	return func() {
+		if contents, err := os.ReadFile(path); err == nil && string(contents) == strconv.Itoa(port) {
+			_ = os.Remove(path)
+		}
+	}, nil
+}
+
+// recordedAPIPort returns the port of the API running in this worktree, or
+// zero if none is. A recorded port this worktree no longer holds the lease on
+// was left behind by a launcher that didn't exit cleanly, so it's ignored.
+func recordedAPIPort(env Environment) (int, error) {
+	contents, err := os.ReadFile(apiPortPath(env))
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("read API port: %w", err)
+	}
+	port, err := strconv.Atoi(strings.TrimSpace(string(contents)))
+	if err != nil {
+		return 0, fmt.Errorf("read API port: %w", err)
+	}
+	if !portLeasedBy(portLockRoot(env), port, env.CurrentRoot) {
+		return 0, nil
+	}
+	return port, nil
+}
+
+func portLockRoot(env Environment) string {
+	return filepath.Join(env.MainRoot, "tmp", "ports")
+}
+
+// confirm asks a yes/no question. Ctrl+C while it waits for an answer stops
+// the command instead of waiting for Enter.
+func (a *App) confirm(ctx context.Context, message string) (bool, error) {
 	if err := a.printf("%s [y/N] ", message); err != nil {
 		return false, err
 	}
-	line, err := bufio.NewReader(a.Stdin).ReadString('\n')
-	if err != nil && !errors.Is(err, io.EOF) {
-		return false, fmt.Errorf("read confirmation: %w", err)
+	type answer struct {
+		line string
+		err  error
 	}
-	answer := strings.ToLower(strings.TrimSpace(line))
-	return answer == "y" || answer == "yes", nil
+	answers := make(chan answer, 1)
+	go func() {
+		line, err := bufio.NewReader(a.Stdin).ReadString('\n')
+		answers <- answer{line: line, err: err}
+	}()
+	select {
+	case <-ctx.Done():
+		return false, ctx.Err()
+	case got := <-answers:
+		if got.err != nil && !errors.Is(got.err, io.EOF) {
+			return false, fmt.Errorf("read confirmation: %w", got.err)
+		}
+		reply := strings.ToLower(strings.TrimSpace(got.line))
+		return reply == "y" || reply == "yes", nil
+	}
 }
 
 func (a *App) printf(format string, values ...any) error {
@@ -434,24 +508,4 @@ func (a *App) printf(format string, values ...any) error {
 		return fmt.Errorf("write command output: %w", err)
 	}
 	return nil
-}
-
-func sourceLabel(env Environment, toMain bool) string {
-	if toMain {
-		return filepath.Base(env.CurrentRoot)
-	}
-	return "main"
-}
-
-func targetLabel(env Environment, toMain bool) string {
-	if toMain {
-		return "main"
-	}
-	return filepath.Base(env.CurrentRoot)
-}
-
-func samePath(left, right string) bool {
-	leftPath, leftErr := filepath.Abs(left)
-	rightPath, rightErr := filepath.Abs(right)
-	return leftErr == nil && rightErr == nil && leftPath == rightPath
 }

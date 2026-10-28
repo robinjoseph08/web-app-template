@@ -1,3 +1,6 @@
+# The shared local PostgreSQL. Don't run this directly: the dev launcher
+# (cmd/dev, behind the mise tasks) pins the project to the main worktree so
+# every worktree uses one container, and picks POSTGRES_PORT.
 services:
   postgres:
     image: postgres:17.6-alpine3.22@sha256:ef257d85f76e48da1c64832459b59fcaba1a4dac97bf5d7450c77753542eee94
@@ -5,16 +8,20 @@ services:
       POSTGRES_DB: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_USER: postgres
+    # Checked over TCP: on first boot, the image runs a temporary server on the
+    # Unix socket only while it initializes, then restarts.
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d postgres"]
       interval: 1s
       timeout: 5s
-      retries: 30
+      retries: 60
+      start_period: 30s
     ports:
-      - "127.0.0.1:${POSTGRES_PORT}:5432"
+      - "127.0.0.1:${POSTGRES_PORT:?run this through the mise tasks}:5432"
+    # A named volume, not a bind mount: Docker Desktop's file sharing does not
+    # give PostgreSQL reliable fsync, so an unclean stop could corrupt it.
     volumes:
-      - type: bind
-        source: ${POSTGRES_DATA_DIR}
-        target: /var/lib/postgresql/data
-        bind:
-          selinux: Z
+      - postgres:/var/lib/postgresql/data
+
+volumes:
+  postgres:

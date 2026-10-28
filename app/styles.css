@@ -1,1 +1,40 @@
 @import "tailwindcss";
+
+/* dark: follows the class app/theme puts on <html>, not the media query, so a
+   visitor's choice can override their device's setting. */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* Colors are named for their role, so components don't pair a light and a
+   dark class for every color. Each role is defined once per theme below.
+   Reach for dark: only for one-off adjustments. */
+@theme inline {
+  --color-surface: var(--surface);
+  --color-panel: var(--panel);
+  --color-line: var(--line);
+  --color-ink: var(--ink);
+  --color-muted: var(--muted);
+  --color-accent: var(--accent);
+}
+
+:root {
+  --surface: var(--color-slate-100);
+  --panel: var(--color-white);
+  --line: var(--color-slate-200);
+  --ink: var(--color-slate-900);
+  --muted: var(--color-slate-600);
+  --accent: var(--color-blue-700);
+  color-scheme: light;
+}
+
+/* Printing stays light, which is what paper and printers expect. */
+@media screen {
+  :root.dark {
+    --surface: var(--color-slate-950);
+    --panel: var(--color-slate-900);
+    --line: var(--color-slate-800);
+    --ink: var(--color-slate-100);
+    --muted: var(--color-slate-400);
+    --accent: var(--color-blue-400);
+    color-scheme: dark;
+  }
+}

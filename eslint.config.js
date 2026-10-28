@@ -26,7 +26,6 @@ export default tseslint.config(
     languageOptions: {
       globals: {
         ...globals.browser,
-        __APP_VERSION__: "readonly",
       },
     },
     plugins: {
@@ -54,6 +53,9 @@ export default tseslint.config(
       "@eslint-react/unsupported-syntax": "off",
       "@eslint-react/use-memo": "off",
 
+      // Native prompts can't be styled and break focus; build dialogs in the
+      // app instead.
+      "no-alert": "error",
       "perfectionist/sort-jsx-props": "error",
       "react-refresh/only-export-components": [
         "warn",

@@ -2,12 +2,15 @@ package templateinit
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
+	"go/format"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"unicode"
 
@@ -115,6 +118,14 @@ func planChanges(root string, files []string, project project) ([]fileChange, bo
 				updated = strings.ReplaceAll(updated, marker, replacement.value(project))
 			}
 		}
+		// A new module path can sort differently among the other imports.
+		if strings.HasSuffix(relative, ".go") && updated != string(contents) {
+			formatted, err := format.Source([]byte(updated))
+			if err != nil {
+				return nil, false, fmt.Errorf("format %s: %w", relative, err)
+			}
+			updated = string(formatted)
+		}
 		if updated != string(contents) {
 			changes = append(changes, fileChange{
 				path:     filePath,
@@ -148,8 +159,7 @@ func applyChanges(changes []fileChange) error {
 
 func rollbackChanges(changes []fileChange) error {
 	var rollbackErr error
-	for index := len(changes) - 1; index >= 0; index-- {
-		change := changes[index]
+	for _, change := range slices.Backward(changes) {
 		if err := atomicWrite(change.path, change.original, change.mode); err != nil {
 			rollbackErr = errors.Join(rollbackErr, fmt.Errorf("restore %s: %w", change.path, err))
 		}
@@ -283,7 +293,7 @@ func isTemplateOnlyFile(relative string) bool {
 }
 
 func trackedFiles(root string) ([]string, error) {
-	command := exec.Command("git", "-C", root, "ls-files", "-z")
+	command := exec.CommandContext(context.Background(), "git", "-C", root, "ls-files", "-z")
 	output, err := command.CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("list tracked files: %w: %s", err, strings.TrimSpace(string(output)))

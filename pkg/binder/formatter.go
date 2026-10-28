@@ -11,7 +11,7 @@ import (
 	"github.com/gorilla/schema"
 )
 
-var timeType = reflect.TypeOf(time.Time{})
+var timeType = reflect.TypeFor[time.Time]()
 
 func formatUnmarshalTypeError(err *json.UnmarshalTypeError) string {
 	return fmt.Sprintf("%q should be of type %s", strings.Trim(err.Field, "."), err.Type)
@@ -53,7 +53,7 @@ func formatValidationError(err validator.FieldError) string {
 		return fmt.Sprintf("%q can't be %q", field, err.Param())
 	case "oneof":
 		values := make([]string, 0, len(strings.Fields(err.Param())))
-		for _, value := range strings.Fields(err.Param()) {
+		for value := range strings.FieldsSeq(err.Param()) {
 			values = append(values, fmt.Sprintf("%q", value))
 		}
 		return fmt.Sprintf("%q must be one of the following: %s", field, strings.Join(values, ", "))
