@@ -2,12 +2,14 @@ package templateinit
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"unicode"
 
@@ -148,8 +150,7 @@ func applyChanges(changes []fileChange) error {
 
 func rollbackChanges(changes []fileChange) error {
 	var rollbackErr error
-	for index := len(changes) - 1; index >= 0; index-- {
-		change := changes[index]
+	for _, change := range slices.Backward(changes) {
 		if err := atomicWrite(change.path, change.original, change.mode); err != nil {
 			rollbackErr = errors.Join(rollbackErr, fmt.Errorf("restore %s: %w", change.path, err))
 		}
@@ -283,7 +284,7 @@ func isTemplateOnlyFile(relative string) bool {
 }
 
 func trackedFiles(root string) ([]string, error) {
-	command := exec.Command("git", "-C", root, "ls-files", "-z")
+	command := exec.CommandContext(context.Background(), "git", "-C", root, "ls-files", "-z")
 	output, err := command.CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("list tracked files: %w: %s", err, strings.TrimSpace(string(output)))
