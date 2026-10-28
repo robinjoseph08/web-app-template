@@ -43,13 +43,13 @@ run = "go run ./cmd/dev start"
 description = "Start API with hot reload via Air"
 run = "go run ./cmd/dev start air"
 
-[tasks."start:web"]
-description = "Start Vite dev server"
-run = "go run ./cmd/dev start web"
-
 [tasks."start:api"]
 description = "Start API directly (no hot reload)"
 run = "go run ./cmd/dev start api"
+
+[tasks."start:web"]
+description = "Start Vite against the API already running in this worktree"
+run = "go run ./cmd/dev start web"
 
 # === Type Generation ===
 
@@ -88,39 +88,49 @@ run = "pnpm lint:types"
 
 # === Testing ===
 
+# Each top-level database test migrates its own schema (pkg/testdb), and Go
+# runs one parallel test per core by default, which can exhaust PostgreSQL's
+# connections on a machine with many cores. Four per package stays well under
+# the server's default limit of 100, so every Go test task sets it.
 [tasks."test:go"]
-description = "Run Go tests with coverage"
+description = "Run Go tests with coverage against this worktree's test database"
 env = { TZ = "America/Chicago", CI = "true" }
-run = "go test ./... -coverprofile coverage.out"
+run = "go run ./cmd/dev test ./... -parallel 4 -coverprofile coverage.out"
 
 [tasks."test:race"]
 description = "Run Go tests with race detection"
 env = { TZ = "America/Chicago", CI = "true" }
-run = "go test -race ./... -coverprofile coverage.out"
+run = "go run ./cmd/dev test -race ./... -parallel 4 -coverprofile coverage.out"
 
 [tasks."test:js"]
 description = "Run all JS tests"
 depends = ["tygo", "test:unit", "test:e2e"]
 
 [tasks."test:js:fast"]
-description = "Run JS tests with chromium e2e only (firefox runs in CI)"
+description = "Run JS tests with Chromium E2E only (every browser runs in CI)"
 depends = ["tygo", "test:unit", "e2e:chromium"]
 
 [tasks."test:unit"]
 description = "Run JS unit tests"
 run = "pnpm test:unit"
 
+# The E2E tasks build the production binary and run Playwright against it.
+# Extra arguments go to Playwright, like mise e2e:chromium e2e/app.spec.ts.
 [tasks."test:e2e"]
-description = "Run E2E tests"
-run = "mkdir -p ./tmp && go run ./cmd/dev e2e"
+description = "Run E2E tests in every browser against the production build"
+run = "go run ./cmd/dev e2e all"
 
 [tasks."e2e:chromium"]
 description = "Run E2E tests in Chromium"
-run = "mkdir -p ./tmp && go run ./cmd/dev e2e chromium"
+run = "go run ./cmd/dev e2e chromium"
 
 [tasks."e2e:firefox"]
 description = "Run E2E tests in Firefox"
-run = "mkdir -p ./tmp && go run ./cmd/dev e2e firefox"
+run = "go run ./cmd/dev e2e firefox"
+
+[tasks."e2e:webkit"]
+description = "Run E2E tests in WebKit"
+run = "go run ./cmd/dev e2e webkit"
 
 [tasks."test:cover"]
 description = "Open coverage report in browser"
@@ -209,32 +219,25 @@ run = "go run ./cmd/dev db rollback"
 description = "Delete all data and recreate the current worktree database schema"
 run = "go run ./cmd/dev db reset"
 
+[tasks."db:stop"]
+description = "Stop the PostgreSQL container shared by every worktree (data is kept)"
+run = "go run ./cmd/dev db stop"
+
+[tasks.psql]
+description = "Open psql on this worktree's database, creating it if needed"
+usage = 'flag "--test" help="Open the Go test database instead"'
+run = '''
+if [ "${usage_test:-false}" = "true" ]; then
+  go run ./cmd/dev psql --test
+else
+  go run ./cmd/dev psql
+fi
+'''
+
 # === Cloning ===
 
-[tasks."clone:db"]
-description = "Clone the main database into this worktree"
-usage = 'flag "--to-main" help="Replace main with this worktree instead"'
-run = '''
-if [ "${usage_to_main:-false}" = "true" ]; then
-  go run ./cmd/dev clone db --to-main
-else
-  go run ./cmd/dev clone db
-fi
-'''
-
-[tasks."clone:files"]
-description = "Clone the main files into this worktree"
-usage = 'flag "--to-main" help="Replace main with this worktree instead"'
-run = '''
-if [ "${usage_to_main:-false}" = "true" ]; then
-  go run ./cmd/dev clone files --to-main
-else
-  go run ./cmd/dev clone files
-fi
-'''
-
 [tasks.clone]
-description = "Clone the main database and files into this worktree"
+description = "Clone the main database into this worktree"
 usage = 'flag "--to-main" help="Replace main with this worktree instead"'
 run = '''
 if [ "${usage_to_main:-false}" = "true" ]; then
@@ -259,9 +262,9 @@ run = '''
 mise install
 pnpm install --frozen-lockfile
 if [ "$(uname -s)" = "Linux" ]; then
-  pnpm exec playwright install --with-deps chromium firefox
+  pnpm exec playwright install --with-deps chromium firefox webkit
 else
-  pnpm exec playwright install chromium firefox
+  pnpm exec playwright install chromium firefox webkit
 fi
 go run ./cmd/dev setup
 mise tygo

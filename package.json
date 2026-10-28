@@ -4,7 +4,6 @@
   "private": true,
   "description": "A full-stack web application template",
   "type": "module",
-  "packageManager": "pnpm@11.25.0",
   "license": "MIT",
   "scripts": {
     "build": "tsc -b && vite build && touch internal/webapp/dist/.gitkeep",
@@ -48,5 +47,8 @@
     "typescript-eslint": "^8.68.0",
     "vite": "^8.2.2",
     "vitest": "^4.1.11"
+  },
+  "engines": {
+    "node": ">=26"
   }
 }

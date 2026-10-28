@@ -7,60 +7,161 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/robinjoseph08/web-app-template/pkg/config"
 	"github.com/robinjoseph08/web-app-template/pkg/database"
 	"github.com/robinjoseph08/web-app-template/pkg/migrations"
+	"github.com/uptrace/bun"
 )
 
-// DockerDatabase manages PostgreSQL through the main worktree's Compose service.
-type DockerDatabase struct{}
+const (
+	defaultPostgresPort   = 5432
+	postgresStartAttempts = 10
+)
 
-func (d *DockerDatabase) Start(ctx context.Context, env Environment) error {
-	if !env.IsMain() {
-		return errors.New("the shared PostgreSQL container may only be started from the main worktree")
+// DatabaseManager owns the shared PostgreSQL container and the databases in it.
+type DatabaseManager interface {
+	// Ensure starts the shared PostgreSQL container if it isn't running and
+	// returns the port it listens on.
+	Ensure(ctx context.Context, env Environment) (int, error)
+	Stop(ctx context.Context, env Environment) error
+	Exists(ctx context.Context, env Environment, name string) (bool, error)
+	Create(ctx context.Context, env Environment, name string) error
+	Clone(ctx context.Context, env Environment, source, target string) error
+	Reset(ctx context.Context, env Environment, name string) error
+	Migrate(ctx context.Context, env Environment, name string) error
+	Rollback(ctx context.Context, env Environment, name string) error
+	Psql(ctx context.Context, env Environment, name string) error
+}
+
+// DockerDatabase manages PostgreSQL through a Compose project pinned to the
+// main worktree, so every worktree shares one container.
+type DockerDatabase struct {
+	// Stdout receives progress messages, like when the container is started.
+	Stdout io.Writer
+}
+
+// Ensure starts the shared container from any worktree. A lock keeps two
+// worktrees from starting it at once.
+func (d *DockerDatabase) Ensure(ctx context.Context, env Environment) (int, error) {
+	unlock, err := lockFile(ctx, filepath.Join(env.MainRoot, "tmp", "database.lock"), func() {
+		d.printf("Waiting for another worktree to finish starting PostgreSQL...\n")
+	})
+	if err != nil {
+		return 0, err
 	}
-	if err := os.MkdirAll(filepath.Join(env.MainRoot, "tmp", "postgres"), 0o755); err != nil {
-		return fmt.Errorf("create PostgreSQL data directory: %w", err)
-	}
-	if err := os.MkdirAll(filepath.Join(env.MainRoot, "tmp", "ports"), 0o755); err != nil {
-		return fmt.Errorf("create port lock directory: %w", err)
-	}
-	if err := d.preparePostgresEnvironment(ctx, env); err != nil {
-		return err
+	defer unlock()
+
+	recorded, err := readPostgresPort(env.MainRoot)
+	if err != nil {
+		return 0, err
 	}
 
-	for attempt := 0; attempt < 10; attempt++ {
-		command, err := d.composeCommand(ctx, env, "up", "-d", "--wait", "postgres")
-		if err != nil {
-			return err
+	// A running container is the source of truth for its port, so a lost or
+	// stale tmp/database.env can't point everything at the wrong one.
+	port, published, err := d.publishedPort(ctx, env, recorded)
+	if err != nil {
+		return 0, err
+	}
+	if published {
+		if port != recorded {
+			if err := writePostgresPort(env.MainRoot, port); err != nil {
+				return 0, err
+			}
 		}
-		output, startErr := command.CombinedOutput()
+		if d.ready(ctx, env, port) {
+			return port, nil
+		}
+	} else {
+		port = recorded
+		if port == 0 || !portAvailable(port) {
+			if port, err = firstAvailablePort(defaultPostgresPort); err != nil {
+				return 0, fmt.Errorf("select PostgreSQL port: %w", err)
+			}
+			if err := writePostgresPort(env.MainRoot, port); err != nil {
+				return 0, err
+			}
+		}
+	}
+
+	for attempt := 1; ; attempt++ {
+		if ctx.Err() != nil {
+			return 0, ctx.Err()
+		}
+		d.printf("Starting PostgreSQL on port %d...\n", port)
+		output, startErr := d.composeCommand(ctx, env, port, "up", "--detach", "--wait", "postgres").CombinedOutput()
 		if startErr == nil {
-			return nil
+			return port, nil
 		}
-		port, err := readPostgresPort(env.MainRoot)
+		if ctx.Err() != nil {
+			return 0, ctx.Err()
+		}
+		if !postgresPortConflict(output) || attempt == postgresStartAttempts {
+			return 0, fmt.Errorf("start PostgreSQL: %w: %s", startErr, strings.TrimSpace(string(output)))
+		}
+		port, err = firstAvailablePort(port + 1)
 		if err != nil {
-			return err
+			return 0, err
 		}
-		if !postgresPortConflict(output) || attempt == 9 {
-			return fmt.Errorf("start PostgreSQL: %w: %s", startErr, strings.TrimSpace(string(output)))
-		}
-		nextPort, err := firstAvailablePort(port + 1)
-		if err != nil {
-			return errors.Join(fmt.Errorf("start PostgreSQL: %w: %s", startErr, strings.TrimSpace(string(output))), err)
-		}
-		if err := writePostgresPort(env.MainRoot, nextPort); err != nil {
-			return err
+		if err := writePostgresPort(env.MainRoot, port); err != nil {
+			return 0, err
 		}
 	}
-	return errors.New("start PostgreSQL: exhausted port retries")
+}
+
+// Stop stops the shared container. Its data stays in the Docker volume.
+func (d *DockerDatabase) Stop(ctx context.Context, env Environment) error {
+	return d.run(ctx, env, "stop PostgreSQL", "stop", "postgres")
+}
+
+// publishedPort asks Docker which host port the running container publishes.
+// It reports false only when Docker says the container isn't running; any
+// other failure is an error, so a hiccup can't make the launcher pick a new
+// port and recreate a container other worktrees are using.
+func (d *DockerDatabase) publishedPort(ctx context.Context, env Environment, recorded int) (int, bool, error) {
+	if recorded == 0 {
+		recorded = defaultPostgresPort
+	}
+	running, err := d.composeOutput(ctx, env, recorded, "ps", "--status", "running", "--quiet", "postgres")
+	if err != nil {
+		return 0, false, fmt.Errorf("check PostgreSQL container: %w", err)
+	}
+	if strings.TrimSpace(running) == "" {
+		return 0, false, nil
+	}
+	output, err := d.composeOutput(ctx, env, recorded, "port", "postgres", "5432")
+	if err != nil {
+		return 0, false, fmt.Errorf("find PostgreSQL port: %w", err)
+	}
+	port, err := parsePublishedPort(output)
+	if err != nil {
+		return 0, false, err
+	}
+	return port, true, nil
+}
+
+// parsePublishedPort reads the port from `docker compose port` output, like
+// "127.0.0.1:5432". The first line is enough, and IPv6 forms like "[::]:5432"
+// work too.
+func parsePublishedPort(output string) (int, error) {
+	line, _, _ := strings.Cut(strings.TrimSpace(output), "\n")
+	index := strings.LastIndex(line, ":")
+	if index < 0 {
+		return 0, fmt.Errorf("unexpected docker compose port output %q", output)
+	}
+	port, err := strconv.Atoi(strings.TrimSpace(line[index+1:]))
+	if err != nil || port < 1 || port > 65535 {
+		return 0, fmt.Errorf("unexpected docker compose port output %q", output)
+	}
+	return port, nil
 }
 
 func postgresPortConflict(output []byte) bool {
@@ -68,142 +169,28 @@ func postgresPortConflict(output []byte) bool {
 	return strings.Contains(message, "port is already allocated") || strings.Contains(message, "address already in use")
 }
 
-func (d *DockerDatabase) RequireRunning(ctx context.Context, env Environment) error {
-	if _, err := os.Stat(postgresEnvironmentPath(env.MainRoot)); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("PostgreSQL is not configured; run mise setup in the main worktree at %s", env.MainRoot)
-		}
-		return fmt.Errorf("read PostgreSQL configuration: %w", err)
+func (d *DockerDatabase) ready(ctx context.Context, env Environment, port int) bool {
+	// Over TCP for the same reason as the healthcheck in compose.yaml.
+	return d.composeCommand(ctx, env, port, "exec", "-T", "postgres", "pg_isready", "-h", "127.0.0.1", "-U", "postgres").Run() == nil
+}
+
+func (d *DockerDatabase) printf(format string, values ...any) {
+	if d.Stdout != nil {
+		_, _ = fmt.Fprintf(d.Stdout, format, values...)
 	}
-	command, err := d.composeCommand(ctx, env, "exec", "-T", "postgres", "pg_isready", "-U", "postgres")
-	if err != nil {
-		return err
-	}
-	if output, err := command.CombinedOutput(); err != nil {
-		return fmt.Errorf("PostgreSQL is not running; run mise setup in the main worktree at %s: %w: %s", env.MainRoot, err, strings.TrimSpace(string(output)))
-	}
-	return nil
 }
 
 func (d *DockerDatabase) Exists(ctx context.Context, env Environment, name string) (bool, error) {
 	query := "SELECT 1 FROM pg_database WHERE datname = '" + sqlLiteral(name) + "'"
-	command, err := d.composeCommand(ctx, env, "exec", "-T", "postgres", "psql", "-U", "postgres", "-d", "postgres", "-tAc", query)
+	output, err := d.psqlOutput(ctx, env, "-tAc", query)
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("check database %s: %w", name, err)
 	}
-	output, err := command.CombinedOutput()
-	if err != nil {
-		return false, fmt.Errorf("check database %s: %w: %s", name, err, strings.TrimSpace(string(output)))
-	}
-	return strings.TrimSpace(string(output)) == "1", nil
+	return strings.TrimSpace(output) == "1", nil
 }
 
 func (d *DockerDatabase) Create(ctx context.Context, env Environment, name string) error {
-	return d.runCompose(ctx, env, "create database "+name, "exec", "-T", "postgres", "createdb", "-U", "postgres", "--template=template0", name)
-}
-
-func (d *DockerDatabase) Clone(ctx context.Context, env Environment, source, target string) (result DatabaseCloneResult, returnErr error) {
-	if source == target {
-		return result, errors.New("source and target databases are the same")
-	}
-	stage, err := stagingDatabaseName()
-	if err != nil {
-		return result, err
-	}
-	if err := d.Create(ctx, env, stage); err != nil {
-		return result, fmt.Errorf("create staging database: %w", err)
-	}
-	stagePresent := true
-	defer func() {
-		if stagePresent {
-			_ = d.drop(context.WithoutCancel(ctx), env, stage)
-		}
-	}()
-
-	if err := d.dumpAndRestore(ctx, env, source, stage); err != nil {
-		return result, err
-	}
-	targetExists, err := d.Exists(ctx, env, target)
-	if err != nil {
-		return result, err
-	}
-	backup := ""
-	swapCtx := context.WithoutCancel(ctx)
-	if targetExists {
-		backup, err = stagingDatabaseName()
-		if err != nil {
-			return result, err
-		}
-		if err := d.terminateConnections(ctx, env, target); err != nil {
-			return result, fmt.Errorf("disconnect database %s: %w", target, err)
-		}
-		if err := d.rename(swapCtx, env, target, backup); err != nil {
-			recoveryErr := d.restoreAmbiguousBackup(swapCtx, env, target, backup)
-			return result, errors.Join(fmt.Errorf("back up database %s: %w", target, err), recoveryErr)
-		}
-	}
-
-	if err := d.rename(swapCtx, env, stage, target); err != nil {
-		installed, verifyErr := d.renameCompleted(swapCtx, env, stage, target)
-		if installed {
-			result.Replaced = true
-			stagePresent = false
-			if backup != "" {
-				if cleanupErr := d.drop(swapCtx, env, backup); cleanupErr != nil {
-					return result, fmt.Errorf("remove replaced database: %w", cleanupErr)
-				}
-			}
-			return result, verifyErr
-		}
-		if backup != "" {
-			restoreErr := d.rename(swapCtx, env, backup, target)
-			if restoreErr != nil {
-				return result, errors.Join(err, verifyErr, fmt.Errorf("restore original database: %w", restoreErr))
-			}
-		}
-		return result, errors.Join(fmt.Errorf("install cloned database: %w", err), verifyErr)
-	}
-	result.Replaced = true
-	stagePresent = false
-	if backup != "" {
-		if err := d.drop(swapCtx, env, backup); err != nil {
-			return result, fmt.Errorf("remove replaced database: %w", err)
-		}
-	}
-	return result, nil
-}
-
-func (d *DockerDatabase) restoreAmbiguousBackup(ctx context.Context, env Environment, target, backup string) error {
-	targetExists, targetErr := d.Exists(ctx, env, target)
-	backupExists, backupErr := d.Exists(ctx, env, backup)
-	if targetErr != nil || backupErr != nil {
-		return errors.Join(targetErr, backupErr)
-	}
-	if !targetExists && backupExists {
-		if err := d.rename(ctx, env, backup, target); err != nil {
-			return fmt.Errorf("restore original database: %w", err)
-		}
-	}
-	return nil
-}
-
-func (d *DockerDatabase) renameCompleted(ctx context.Context, env Environment, source, target string) (bool, error) {
-	targetExists, targetErr := d.Exists(ctx, env, target)
-	sourceExists, sourceErr := d.Exists(ctx, env, source)
-	if targetErr != nil || sourceErr != nil {
-		return false, errors.Join(targetErr, sourceErr)
-	}
-	return targetExists && !sourceExists, nil
-}
-
-func (d *DockerDatabase) rename(ctx context.Context, env Environment, source, target string) error {
-	query := fmt.Sprintf("ALTER DATABASE %s RENAME TO %s", quoteIdentifier(source), quoteIdentifier(target))
-	return d.runCompose(ctx, env, "rename database", "exec", "-T", "postgres", "psql", "-v", "ON_ERROR_STOP=1", "-U", "postgres", "-d", "postgres", "-c", query)
-}
-
-func (d *DockerDatabase) terminateConnections(ctx context.Context, env Environment, name string) error {
-	query := "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '" + sqlLiteral(name) + "'"
-	return d.runCompose(ctx, env, "terminate database connections", "exec", "-T", "postgres", "psql", "-v", "ON_ERROR_STOP=1", "-U", "postgres", "-d", "postgres", "-c", query)
+	return d.run(ctx, env, "create database "+name, "exec", "-T", "postgres", "createdb", "-U", "postgres", "--template=template0", name)
 }
 
 func (d *DockerDatabase) Reset(ctx context.Context, env Environment, name string) error {
@@ -214,190 +201,325 @@ func (d *DockerDatabase) Reset(ctx context.Context, env Environment, name string
 }
 
 func (d *DockerDatabase) Migrate(ctx context.Context, env Environment, name string) error {
-	cfg, err := databaseConfig(env, name)
-	if err != nil {
-		return err
-	}
-	db, err := database.New(cfg)
-	if err != nil {
-		return fmt.Errorf("open database %s: %w", name, err)
-	}
-	defer func() { _ = db.Close() }()
-	if _, err := migrations.BringUpToDate(ctx, db); err != nil {
-		return fmt.Errorf("migrate database %s: %w", name, err)
-	}
-	return nil
+	return withDatabase(ctx, env, name, func(db *bun.DB) error {
+		if _, err := migrations.BringUpToDate(ctx, db); err != nil {
+			return fmt.Errorf("migrate database %s: %w", name, err)
+		}
+		return nil
+	})
 }
 
 func (d *DockerDatabase) Rollback(ctx context.Context, env Environment, name string) error {
-	cfg, err := databaseConfig(env, name)
+	return withDatabase(ctx, env, name, func(db *bun.DB) error {
+		if _, err := migrations.Rollback(ctx, db); err != nil {
+			return fmt.Errorf("roll back database %s: %w", name, err)
+		}
+		return nil
+	})
+}
+
+func (d *DockerDatabase) Psql(ctx context.Context, env Environment, name string) error {
+	port, err := readPostgresPort(env.MainRoot)
 	if err != nil {
 		return err
 	}
-	db, err := database.New(cfg)
-	if err != nil {
-		return fmt.Errorf("open database %s: %w", name, err)
+	args := []string{"exec"}
+	// Docker refuses to allocate a TTY when input is piped, as in
+	// `echo 'select 1' | mise psql`.
+	if info, err := os.Stdin.Stat(); err == nil && info.Mode()&os.ModeCharDevice == 0 {
+		args = append(args, "-T")
 	}
-	defer func() { _ = db.Close() }()
-	if _, err := migrations.Rollback(ctx, db); err != nil {
-		return fmt.Errorf("roll back database %s: %w", name, err)
+	args = append(args, "postgres", "psql", "-U", "postgres", "-d", name)
+	command := d.composeCommand(ctx, env, port, args...)
+	// psql stays in the terminal's process group so Ctrl+C cancels a query
+	// instead of ending the session.
+	command.SysProcAttr = nil
+	command.Stdin = os.Stdin
+	command.Stdout = os.Stdout
+	command.Stderr = os.Stderr
+	err = command.Run()
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return err
+}
+
+// Clone copies source into target through a staging database, so target is
+// only replaced once the copy has fully restored. The old target is renamed
+// aside until the new one is in place, and put back if installing fails.
+func (d *DockerDatabase) Clone(ctx context.Context, env Environment, source, target string) error {
+	if source == target {
+		return errors.New("source and target databases are the same")
+	}
+	stage, err := stagingDatabaseName()
+	if err != nil {
+		return err
+	}
+	// The swap and cleanup ignore cancellation, so an interrupt can't stop
+	// them halfway. Their docker commands run in their own process groups, so
+	// Ctrl+C in the terminal doesn't reach them either. Cleanup is registered
+	// before the staging database is created, since an interrupt can report
+	// failure for a createdb that actually succeeded.
+	background := context.WithoutCancel(ctx)
+	stagePresent := true
+	defer func() {
+		if stagePresent {
+			_ = d.drop(background, env, stage)
+		}
+	}()
+	if err := d.Create(ctx, env, stage); err != nil {
+		return fmt.Errorf("create staging database: %w", err)
+	}
+
+	if err := d.dumpAndRestore(ctx, env, source, stage); err != nil {
+		return err
+	}
+	targetExists, err := d.Exists(ctx, env, target)
+	if err != nil {
+		return err
+	}
+
+	backup := ""
+	if targetExists {
+		if backup, err = stagingDatabaseName(); err != nil {
+			return err
+		}
+		if err := d.disconnectAndRename(background, env, target, backup); err != nil {
+			return fmt.Errorf("move database %s aside: %w", target, err)
+		}
+	}
+	if err := d.rename(background, env, stage, target); err != nil {
+		if backup != "" {
+			if restoreErr := d.rename(background, env, backup, target); restoreErr != nil {
+				return errors.Join(
+					fmt.Errorf("install cloned database: %w", err),
+					fmt.Errorf("restore original database %s from %s: %w", target, backup, restoreErr),
+				)
+			}
+		}
+		return fmt.Errorf("install cloned database: %w", err)
+	}
+	stagePresent = false
+	if backup != "" {
+		// The clone itself succeeded, so a leftover backup is only worth a
+		// warning.
+		if err := d.drop(background, env, backup); err != nil {
+			d.printf("Warning: couldn't remove the replaced database %s: %v\n", backup, err)
+		}
 	}
 	return nil
 }
 
-func (d *DockerDatabase) dumpAndRestore(ctx context.Context, env Environment, source, target string) error {
-	dump, err := d.composeCommand(ctx, env, "exec", "-T", "postgres", "pg_dump", "-U", "postgres", "--format=custom", "--no-owner", "--no-privileges", "--dbname="+source)
-	if err != nil {
-		return err
+// disconnectAndRename renames a database other clients may be using. A client
+// that reconnects between disconnecting and renaming makes the rename fail, so
+// it's retried a few times.
+func (d *DockerDatabase) disconnectAndRename(ctx context.Context, env Environment, source, target string) error {
+	var err error
+	for attempt := range 5 {
+		if attempt > 0 {
+			time.Sleep(200 * time.Millisecond)
+		}
+		if err = d.terminateConnections(ctx, env, source); err != nil {
+			continue
+		}
+		if err = d.rename(ctx, env, source, target); err == nil {
+			return nil
+		}
 	}
-	restore, err := d.composeCommand(ctx, env, "exec", "-T", "postgres", "pg_restore", "-U", "postgres", "--exit-on-error", "--no-owner", "--no-privileges", "--dbname="+target)
-	if err != nil {
-		return err
-	}
+	return err
+}
 
-	pipe, err := dump.StdoutPipe()
+func (d *DockerDatabase) dumpAndRestore(ctx context.Context, env Environment, source, target string) error {
+	port, err := readPostgresPort(env.MainRoot)
+	if err != nil {
+		return err
+	}
+	dump := d.composeCommand(ctx, env, port, "exec", "-T", "postgres", "pg_dump", "-U", "postgres", "--format=custom", "--no-owner", "--no-privileges", "--dbname="+source)
+	restore := d.composeCommand(ctx, env, port, "exec", "-T", "postgres", "pg_restore", "-U", "postgres", "--exit-on-error", "--no-owner", "--no-privileges", "--dbname="+target)
+
+	// An explicit pipe whose ends this process closes after starting both
+	// commands. Otherwise a restore that fails early leaves this process
+	// holding the read end, and pg_dump blocks forever on a full pipe.
+	reader, writer, err := os.Pipe()
 	if err != nil {
 		return fmt.Errorf("create database dump pipe: %w", err)
 	}
 	var dumpErrors, restoreErrors bytes.Buffer
+	dump.Stdout = writer
 	dump.Stderr = &dumpErrors
-	restore.Stdin = pipe
+	restore.Stdin = reader
 	restore.Stderr = &restoreErrors
 
 	if err := restore.Start(); err != nil {
+		_ = reader.Close()
+		_ = writer.Close()
 		return fmt.Errorf("start database restore: %w", err)
 	}
 	if err := dump.Start(); err != nil {
+		_ = reader.Close()
+		_ = writer.Close()
 		_ = restore.Process.Kill()
 		_ = restore.Wait()
 		return fmt.Errorf("start database dump: %w", err)
 	}
-	dumpErr := dump.Wait()
+	_ = reader.Close()
+	_ = writer.Close()
+
 	restoreErr := restore.Wait()
+	dumpErr := dump.Wait()
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	// Either side failing usually makes the other fail too, so both are
+	// reported: a dump error is the cause behind a "file too short" restore.
+	var errs []error
 	if dumpErr != nil {
-		return fmt.Errorf("dump database %s: %w: %s", source, dumpErr, strings.TrimSpace(dumpErrors.String()))
+		errs = append(errs, fmt.Errorf("dump database %s: %w: %s", source, dumpErr, strings.TrimSpace(dumpErrors.String())))
 	}
 	if restoreErr != nil {
-		return fmt.Errorf("restore database %s: %w: %s", target, restoreErr, strings.TrimSpace(restoreErrors.String()))
+		errs = append(errs, fmt.Errorf("restore database %s: %w: %s", target, restoreErr, strings.TrimSpace(restoreErrors.String())))
 	}
-	return nil
+	return errors.Join(errs...)
+}
+
+func (d *DockerDatabase) rename(ctx context.Context, env Environment, source, target string) error {
+	_, err := d.psqlOutput(ctx, env, "-c", fmt.Sprintf("ALTER DATABASE %s RENAME TO %s", quoteIdentifier(source), quoteIdentifier(target)))
+	return err
 }
 
 func (d *DockerDatabase) drop(ctx context.Context, env Environment, name string) error {
-	return d.runCompose(ctx, env, "drop database "+name, "exec", "-T", "postgres", "dropdb", "-U", "postgres", "--force", "--if-exists", name)
+	return d.run(ctx, env, "drop database "+name, "exec", "-T", "postgres", "dropdb", "-U", "postgres", "--force", "--if-exists", name)
 }
 
-func (d *DockerDatabase) runCompose(ctx context.Context, env Environment, action string, args ...string) error {
-	command, err := d.composeCommand(ctx, env, args...)
+func (d *DockerDatabase) terminateConnections(ctx context.Context, env Environment, name string) error {
+	query := "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '" + sqlLiteral(name) + "' AND pid <> pg_backend_pid()"
+	_, err := d.psqlOutput(ctx, env, "-c", query)
+	return err
+}
+
+func (d *DockerDatabase) psqlOutput(ctx context.Context, env Environment, args ...string) (string, error) {
+	port, err := readPostgresPort(env.MainRoot)
+	if err != nil {
+		return "", err
+	}
+	commandArgs := append([]string{"exec", "-T", "postgres", "psql", "-X", "-v", "ON_ERROR_STOP=1", "-U", "postgres", "-d", "postgres"}, args...)
+	output, err := d.composeCommand(ctx, env, port, commandArgs...).CombinedOutput()
+	if ctx.Err() != nil {
+		return "", ctx.Err()
+	}
+	if err != nil {
+		return "", fmt.Errorf("%w: %s", err, strings.TrimSpace(string(output)))
+	}
+	return string(output), nil
+}
+
+// composeOutput runs a docker compose command and returns its standard
+// output.
+func (d *DockerDatabase) composeOutput(ctx context.Context, env Environment, port int, args ...string) (string, error) {
+	var stdout, stderr bytes.Buffer
+	command := d.composeCommand(ctx, env, port, args...)
+	command.Stdout = &stdout
+	command.Stderr = &stderr
+	err := command.Run()
+	if ctx.Err() != nil {
+		return "", ctx.Err()
+	}
+	if err != nil {
+		return "", fmt.Errorf("%w: %s", err, strings.TrimSpace(stderr.String()))
+	}
+	return stdout.String(), nil
+}
+
+func (d *DockerDatabase) run(ctx context.Context, env Environment, action string, args ...string) error {
+	port, err := readPostgresPort(env.MainRoot)
 	if err != nil {
 		return err
 	}
-	output, err := command.CombinedOutput()
+	output, err := d.composeCommand(ctx, env, port, args...).CombinedOutput()
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	if err != nil {
 		return fmt.Errorf("%s: %w: %s", action, err, strings.TrimSpace(string(output)))
 	}
 	return nil
 }
 
-func (d *DockerDatabase) composeCommand(ctx context.Context, env Environment, args ...string) (*exec.Cmd, error) {
-	port, err := readPostgresPort(env.MainRoot)
-	if err != nil {
-		return nil, err
+// composeCommand pins the project name and directory to the main worktree so
+// every worktree drives the same container, but reads this worktree's
+// compose.yaml so a main worktree that's behind doesn't break newer branches.
+func (d *DockerDatabase) composeCommand(ctx context.Context, env Environment, port int, args ...string) *exec.Cmd {
+	commandArgs := []string{
+		"compose",
+		"--project-name", env.ProjectName,
+		"--project-directory", env.MainRoot,
+		"--file", filepath.Join(env.CurrentRoot, "compose.yaml"),
 	}
-	composeFile := filepath.Join(env.MainRoot, "compose.yaml")
-	commandArgs := []string{"compose", "--project-name", env.ProjectName, "--project-directory", env.MainRoot, "--file", composeFile}
 	commandArgs = append(commandArgs, args...)
 	command := exec.CommandContext(ctx, "docker", commandArgs...)
 	command.Dir = env.MainRoot
-	command.Env = append(os.Environ(),
-		"POSTGRES_PORT="+strconv.Itoa(port),
-		"POSTGRES_DATA_DIR="+filepath.Join(env.MainRoot, "tmp", "postgres"),
-	)
-	return command, nil
+	command.Env = append(os.Environ(), "POSTGRES_PORT="+strconv.Itoa(port))
+	// Ctrl+C only reaches the launcher, which decides what to cancel.
+	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	return command
 }
 
-func (d *DockerDatabase) preparePostgresEnvironment(ctx context.Context, env Environment) error {
-	path := postgresEnvironmentPath(env.MainRoot)
-	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
-		port, portErr := firstAvailablePort(5432)
-		if portErr != nil {
-			return fmt.Errorf("select PostgreSQL port: %w", portErr)
-		}
-		return writePostgresPort(env.MainRoot, port)
-	} else if err != nil {
-		return fmt.Errorf("stat PostgreSQL environment: %w", err)
-	}
-
+// withDatabase connects to a database in the shared container for the
+// launcher's own work, like migrations.
+func withDatabase(ctx context.Context, env Environment, name string, work func(*bun.DB) error) error {
 	port, err := readPostgresPort(env.MainRoot)
 	if err != nil {
 		return err
 	}
-	running, err := d.postgresRunning(ctx, env)
+	cfg := config.NewForTest()
+	cfg.AppEnv = config.EnvironmentDevelopment
+	cfg.DatabaseURL = DatabaseURL(port, name)
+	cfg.DatabaseDebug = false
+	cfg.DatabaseConnectRetryCount = 5
+	cfg.DatabaseConnectRetryDelay = 500 * time.Millisecond
+	db, err := database.New(ctx, cfg)
 	if err != nil {
-		return err
+		return fmt.Errorf("open database %s: %w", name, err)
 	}
-	if running || portAvailable(port) {
-		return nil
-	}
-	nextPort, err := firstAvailablePort(5432)
-	if err != nil {
-		return fmt.Errorf("select replacement PostgreSQL port: %w", err)
-	}
-	return writePostgresPort(env.MainRoot, nextPort)
+	defer func() { _ = db.Close() }()
+	return work(db)
 }
 
-func (d *DockerDatabase) postgresRunning(ctx context.Context, env Environment) (bool, error) {
-	command, err := d.composeCommand(ctx, env, "exec", "-T", "postgres", "pg_isready", "-U", "postgres")
-	if err != nil {
-		return false, err
-	}
-	if err := command.Run(); err != nil {
-		return false, nil
-	}
-	return true, nil
-}
-
-func writePostgresPort(mainRoot string, port int) error {
-	path := postgresEnvironmentPath(mainRoot)
+// lockFile holds an exclusive advisory lock on path until the returned
+// function is called. While another process holds it, onWait is called once
+// and the lock is retried until ctx is done.
+func lockFile(ctx context.Context, path string, onWait func()) (func(), error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return fmt.Errorf("create PostgreSQL environment directory: %w", err)
+		return nil, fmt.Errorf("create lock directory: %w", err)
 	}
-	file, err := os.CreateTemp(filepath.Dir(path), ".database-env-")
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
-		return fmt.Errorf("create PostgreSQL environment: %w", err)
+		return nil, fmt.Errorf("open lock %s: %w", path, err)
 	}
-	temporaryPath := file.Name()
-	defer func() { _ = os.Remove(temporaryPath) }()
-	if err := file.Chmod(0o600); err != nil {
+	waited := false
+	for {
+		err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, syscall.EWOULDBLOCK) {
+			_ = file.Close()
+			return nil, fmt.Errorf("lock %s: %w", path, err)
+		}
+		if !waited {
+			onWait()
+			waited = true
+		}
+		select {
+		case <-ctx.Done():
+			_ = file.Close()
+			return nil, ctx.Err()
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+	return func() {
+		_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
 		_ = file.Close()
-		return fmt.Errorf("set PostgreSQL environment permissions: %w", err)
-	}
-	if _, err := fmt.Fprintf(file, "POSTGRES_PORT=%d\n", port); err != nil {
-		_ = file.Close()
-		return fmt.Errorf("write PostgreSQL environment: %w", err)
-	}
-	if err := file.Close(); err != nil {
-		return fmt.Errorf("close PostgreSQL environment: %w", err)
-	}
-	if err := os.Rename(temporaryPath, path); err != nil {
-		return fmt.Errorf("install PostgreSQL environment: %w", err)
-	}
-	return nil
-}
-
-func databaseConfig(env Environment, name string) (*config.Config, error) {
-	port, err := readPostgresPort(env.MainRoot)
-	if err != nil {
-		return nil, err
-	}
-	return &config.Config{
-		DatabaseURL:               fmt.Sprintf("postgres://postgres:postgres@127.0.0.1:%d/%s?sslmode=disable", port, name),
-		DatabaseConnectRetryCount: 5,
-		DatabaseConnectRetryDelay: 500 * time.Millisecond,
-		FilesPath:                 env.CurrentFilesPath(),
-		ServerHost:                "127.0.0.1",
-		ServerPort:                0,
-		Hostname:                  "development",
 	}, nil
 }
 
@@ -406,7 +528,7 @@ func stagingDatabaseName() (string, error) {
 	if _, err := rand.Read(random[:]); err != nil {
 		return "", fmt.Errorf("generate staging database name: %w", err)
 	}
-	return "app_stage_" + hex.EncodeToString(random[:]), nil
+	return "clone_stage_" + hex.EncodeToString(random[:]), nil
 }
 
 func quoteIdentifier(value string) string {

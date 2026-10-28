@@ -14,8 +14,59 @@ import (
 	"unicode"
 )
 
-const maxProjectIdentifierLength = 40
+const (
+	maxProjectIdentifierLength = 40
+	// PostgreSQL truncates identifiers longer than 63 bytes.
+	maxIdentifierLength = 63
+	testDatabaseSuffix  = "_test"
+	// The e2e database's suffix is no longer than the test database's, so
+	// names leave room for both.
+	e2eDatabaseSuffix = "_e2e"
+)
 
+// Environment describes the repository and worktree resources used by a
+// command.
+type Environment struct {
+	MainRoot        string
+	CurrentRoot     string
+	MainDatabase    string
+	CurrentDatabase string
+	ProjectName     string
+}
+
+// IsMain reports whether the command runs in the main worktree rather than a
+// linked one.
+func (e Environment) IsMain() bool {
+	return samePath(e.MainRoot, e.CurrentRoot)
+}
+
+// CookieNamespace prefixes the API's cookie names. Every worktree's dev
+// server can end up on the same localhost port, and browsers keep cookies per
+// host, so worktrees would otherwise share a session, along with ids from
+// another worktree's database. The database name is already unique per
+// worktree and a valid namespace.
+func (e Environment) CookieNamespace() string {
+	return e.CurrentDatabase
+}
+
+// TestDatabase is the database this worktree's Go tests run against. Each
+// test gets its own schema in it (see pkg/testdb).
+func (e Environment) TestDatabase() string {
+	return e.CurrentDatabase + testDatabaseSuffix
+}
+
+// E2EDatabase is the database the e2e tests run against. It's rebuilt on every
+// run.
+func (e Environment) E2EDatabase() string {
+	return e.CurrentDatabase + e2eDatabaseSuffix
+}
+
+// DatabaseURL is the URL of a database in the shared PostgreSQL container.
+func DatabaseURL(port int, name string) string {
+	return fmt.Sprintf("postgres://postgres:postgres@127.0.0.1:%d/%s?sslmode=disable", port, name)
+}
+
+// ResolveEnvironment finds the main worktree and current worktree from git.
 func ResolveEnvironment(ctx context.Context) (Environment, error) {
 	currentRoot, err := gitOutput(ctx, "rev-parse", "--show-toplevel")
 	if err != nil {
@@ -25,8 +76,7 @@ func ResolveEnvironment(ctx context.Context) (Environment, error) {
 	if err != nil {
 		return Environment{}, err
 	}
-	mainRoot := filepath.Dir(commonDir)
-	mainRoot, err = filepath.EvalSymlinks(mainRoot)
+	mainRoot, err := filepath.EvalSymlinks(filepath.Dir(commonDir))
 	if err != nil {
 		return Environment{}, fmt.Errorf("resolve main worktree path: %w", err)
 	}
@@ -35,18 +85,31 @@ func ResolveEnvironment(ctx context.Context) (Environment, error) {
 		return Environment{}, fmt.Errorf("resolve current worktree path: %w", err)
 	}
 
-	port, err := readPostgresPort(mainRoot)
-	if err != nil {
-		return Environment{}, err
-	}
 	return Environment{
 		MainRoot:        mainRoot,
 		CurrentRoot:     currentRoot,
 		MainDatabase:    repositoryIdentifier(mainRoot),
 		CurrentDatabase: worktreeDatabaseName(mainRoot, currentRoot),
-		PostgresPort:    port,
 		ProjectName:     projectName(mainRoot),
 	}, nil
+}
+
+// TestDatabaseURL is the URL of this worktree's test database, for Go tests
+// run without the launcher, like from an editor. It doesn't start PostgreSQL
+// or create the database; mise setup does both.
+func TestDatabaseURL(ctx context.Context) (string, error) {
+	env, err := ResolveEnvironment(ctx)
+	if err != nil {
+		return "", err
+	}
+	port, err := readPostgresPort(env.MainRoot)
+	if err != nil {
+		return "", err
+	}
+	if port == 0 {
+		port = defaultPostgresPort
+	}
+	return DatabaseURL(port, env.TestDatabase()), nil
 }
 
 func gitOutput(ctx context.Context, args ...string) (string, error) {
@@ -58,6 +121,10 @@ func gitOutput(ctx context.Context, args ...string) (string, error) {
 	return strings.TrimSpace(string(output)), nil
 }
 
+// worktreeDatabaseName names the main worktree's database after the
+// repository, and each linked worktree's after the repository, the worktree
+// directory, and a hash of its path. Room is left for the test database's
+// suffix.
 func worktreeDatabaseName(mainRoot, currentRoot string) string {
 	project := repositoryIdentifier(mainRoot)
 	if samePath(mainRoot, currentRoot) {
@@ -66,10 +133,9 @@ func worktreeDatabaseName(mainRoot, currentRoot string) string {
 	hash := shortHash(currentRoot)
 	slug := sanitizeIdentifier(filepath.Base(currentRoot))
 	const suffixLength = 1 + 8
-	const maxIdentifierLength = 63
-	maxSlugLength := maxIdentifierLength - len(project) - 1 - suffixLength
+	maxSlugLength := maxIdentifierLength - len(testDatabaseSuffix) - len(project) - 1 - suffixLength
 	if len(slug) > maxSlugLength {
-		slug = slug[:maxSlugLength]
+		slug = strings.TrimRight(slug[:maxSlugLength], "_")
 	}
 	return project + "_" + slug + "_" + hash
 }
@@ -81,7 +147,7 @@ func projectName(mainRoot string) string {
 func repositoryIdentifier(root string) string {
 	identifier := sanitizeIdentifier(filepath.Base(root))
 	if len(identifier) > maxProjectIdentifierLength {
-		identifier = identifier[:maxProjectIdentifierLength]
+		identifier = strings.TrimRight(identifier[:maxProjectIdentifierLength], "_")
 	}
 	return identifier
 }
@@ -117,10 +183,12 @@ func postgresEnvironmentPath(mainRoot string) string {
 	return filepath.Join(mainRoot, "tmp", "database.env")
 }
 
+// readPostgresPort returns the shared PostgreSQL port recorded in the main
+// worktree, or zero if none has been chosen yet.
 func readPostgresPort(mainRoot string) (int, error) {
 	file, err := os.Open(postgresEnvironmentPath(mainRoot))
 	if os.IsNotExist(err) {
-		return 5432, nil
+		return 0, nil
 	}
 	if err != nil {
 		return 0, fmt.Errorf("open PostgreSQL environment: %w", err)
@@ -142,4 +210,34 @@ func readPostgresPort(mainRoot string) (int, error) {
 		return 0, fmt.Errorf("read PostgreSQL environment: %w", err)
 	}
 	return 0, fmt.Errorf("POSTGRES_PORT is missing from %s", file.Name())
+}
+
+func writePostgresPort(mainRoot string, port int) error {
+	path := postgresEnvironmentPath(mainRoot)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("create PostgreSQL environment directory: %w", err)
+	}
+	file, err := os.CreateTemp(filepath.Dir(path), ".database-env-")
+	if err != nil {
+		return fmt.Errorf("create PostgreSQL environment: %w", err)
+	}
+	temporaryPath := file.Name()
+	defer func() { _ = os.Remove(temporaryPath) }()
+	if _, err := fmt.Fprintf(file, "POSTGRES_PORT=%d\n", port); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("write PostgreSQL environment: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close PostgreSQL environment: %w", err)
+	}
+	if err := os.Rename(temporaryPath, path); err != nil {
+		return fmt.Errorf("install PostgreSQL environment: %w", err)
+	}
+	return nil
+}
+
+func samePath(left, right string) bool {
+	leftPath, leftErr := filepath.Abs(left)
+	rightPath, rightErr := filepath.Abs(right)
+	return leftErr == nil && rightErr == nil && leftPath == rightPath
 }
