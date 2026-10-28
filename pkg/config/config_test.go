@@ -92,7 +92,7 @@ func TestLoadValidatesConfig(t *testing.T) {
 
 	_, err := load(path, false, mapProvider{}, func() (string, error) { return "host", nil })
 	require.Error(t, err)
-	assert.EqualError(t, err, "database_url: required")
+	assert.EqualError(t, err, "database_url: failed required")
 }
 
 func TestLoadRejectsUnknownFileSettings(t *testing.T) {

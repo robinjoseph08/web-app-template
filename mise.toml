@@ -225,7 +225,7 @@ run = "go run ./cmd/dev db stop"
 
 [tasks.psql]
 description = "Open psql on this worktree's database, creating it if needed"
-usage = 'flag "--test" help="Open the Go test database instead"'
+usage = 'flag "--test" help="Open the Go test database instead (its tables live in per-test schemas, so it is not migrated)"'
 run = '''
 if [ "${usage_test:-false}" = "true" ]; then
   go run ./cmd/dev psql --test

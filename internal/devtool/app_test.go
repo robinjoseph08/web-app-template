@@ -274,6 +274,24 @@ func TestStartWebIgnoresAPortAnotherWorktreeLeased(t *testing.T) {
 	assert.Contains(t, err.Error(), "no API is running in this worktree")
 }
 
+func TestRecordAPIPortLeavesAnotherAPIsPort(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t, false)
+
+	forgetFirst, err := recordAPIPort(h.env, 3579)
+	require.NoError(t, err)
+	forgetSecond, err := recordAPIPort(h.env, 3580)
+	require.NoError(t, err)
+
+	forgetFirst()
+	contents, err := os.ReadFile(apiPortPath(h.env))
+	require.NoError(t, err, "the first API stopping leaves the second's port")
+	assert.Equal(t, "3580", string(contents))
+
+	forgetSecond()
+	assert.NoFileExists(t, apiPortPath(h.env))
+}
+
 func TestStartRejectsUnknownModes(t *testing.T) {
 	t.Parallel()
 	h := newHarness(t, false)
@@ -468,6 +486,23 @@ func TestParsePublishedPort(t *testing.T) {
 		_, err := parsePublishedPort(output)
 		assert.Error(t, err, output)
 	}
+}
+
+func TestWarnsAboutDataLeftInTmpPostgres(t *testing.T) {
+	t.Parallel()
+
+	env := Environment{MainRoot: t.TempDir()}
+	var out bytes.Buffer
+	database := &DockerDatabase{Stdout: &out}
+
+	database.warnAboutBindMountData(env)
+	assert.Empty(t, out.String())
+
+	old := filepath.Join(env.MainRoot, "tmp", "postgres")
+	require.NoError(t, os.MkdirAll(old, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(old, "PG_VERSION"), []byte("17\n"), 0o600))
+	database.warnAboutBindMountData(env)
+	assert.Contains(t, out.String(), "Upgrading from tmp/postgres")
 }
 
 func TestComposeCommandsShareTheMainWorktreeProject(t *testing.T) {

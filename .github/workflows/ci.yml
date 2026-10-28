@@ -46,7 +46,9 @@ jobs:
           path: |
             ~/.cache/go-build
             ~/go/pkg/mod
-          key: go-${{ runner.os }}-${{ hashFiles('mise.toml', 'go.sum') }}
+            tmp/golangci-lint-cache
+          key: go-${{ env.ImageOS }}-${{ hashFiles('mise.toml', 'go.sum') }}
+          restore-keys: go-${{ env.ImageOS }}-
       - run: mise lint:go
       - run: mise test:race
 
@@ -62,7 +64,7 @@ jobs:
       - uses: actions/cache@v6
         with:
           path: node_modules
-          key: node-modules-${{ runner.os }}-${{ hashFiles('mise.toml', 'pnpm-lock.yaml') }}
+          key: node-modules-${{ env.ImageOS }}-${{ hashFiles('mise.toml', 'pnpm-lock.yaml') }}
       - run: pnpm install --frozen-lockfile
       - run: mise tygo
       - run: mise lint:js
@@ -83,7 +85,7 @@ jobs:
       - uses: actions/cache@v6
         with:
           path: node_modules
-          key: node-modules-${{ runner.os }}-${{ hashFiles('mise.toml', 'pnpm-lock.yaml') }}
+          key: node-modules-${{ env.ImageOS }}-${{ hashFiles('mise.toml', 'pnpm-lock.yaml') }}
       # Its own key, since this job builds ./cmd/api and ./cmd/dev, which the
       # Go job's cache doesn't hold.
       - uses: actions/cache@v6
@@ -91,7 +93,8 @@ jobs:
           path: |
             ~/.cache/go-build
             ~/go/pkg/mod
-          key: go-e2e-${{ runner.os }}-${{ hashFiles('mise.toml', 'go.sum') }}
+          key: go-e2e-${{ env.ImageOS }}-${{ hashFiles('mise.toml', 'go.sum') }}
+          restore-keys: go-e2e-${{ env.ImageOS }}-
 
       - name: Install dependencies
         run: |
@@ -173,10 +176,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: jdx/mise-action@v4
+        with:
+          install_args: go node npm:pnpm github:gzuidhof/tygo
       - uses: actions/cache@v6
         with:
           path: node_modules
-          key: node-modules-${{ runner.os }}-${{ hashFiles('mise.toml', 'pnpm-lock.yaml') }}
+          key: node-modules-${{ env.ImageOS }}-${{ hashFiles('mise.toml', 'pnpm-lock.yaml') }}
       - run: pnpm install --frozen-lockfile
       - run: mise build
       - run: mise docker

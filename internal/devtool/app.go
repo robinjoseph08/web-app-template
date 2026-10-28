@@ -39,9 +39,7 @@ const (
 // e2eBrowsers are the Playwright projects in playwright.config.ts.
 var e2eBrowsers = []string{"chromium", "firefox", "webkit"}
 
-// defaultTestArgs bound test parallelism: each top-level database test
-// migrates its own schema, and Go runs one parallel test per core by default,
-// which can exhaust PostgreSQL's connections on a machine with many cores.
+// defaultTestArgs match mise test:go, which explains -parallel 4.
 var defaultTestArgs = []string{"./...", "-parallel", "4", "-coverprofile", "coverage.out"}
 
 // App implements the command interface used by mise tasks.
@@ -385,6 +383,16 @@ func (a *App) e2e(ctx context.Context, env Environment, args []string) error {
 // ensureDevelopmentDatabase creates this worktree's database if needed, copied
 // from the main worktree's when that exists, and brings it up to date.
 func (a *App) ensureDevelopmentDatabase(ctx context.Context, env Environment) error {
+	// Two commands setting up the same new database at once would both clone
+	// it, and the second would drop the first's copy from under it.
+	unlock, err := lockFile(ctx, filepath.Join(env.CurrentRoot, "tmp", "database-setup.lock"), func() {
+		_ = a.printf("Waiting for another command in this worktree to set up %s...\n", env.CurrentDatabase)
+	})
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
 	exists, err := a.Database.Exists(ctx, env, env.CurrentDatabase)
 	if err != nil {
 		return err
@@ -434,7 +442,13 @@ func recordAPIPort(env Environment, port int) (func(), error) {
 	if err := os.WriteFile(path, []byte(strconv.Itoa(port)), 0o600); err != nil {
 		return nil, fmt.Errorf("record API port: %w", err)
 	}
-	return func() { _ = os.Remove(path) }, nil
+	// A second API in this worktree may have recorded its own port since, so
+	// only this one's is removed.
+	return func() {
+		if contents, err := os.ReadFile(path); err == nil && string(contents) == strconv.Itoa(port) {
+			_ = os.Remove(path)
+		}
+	}, nil
 }
 
 // recordedAPIPort returns the port of the API running in this worktree, or

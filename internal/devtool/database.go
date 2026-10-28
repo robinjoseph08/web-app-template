@@ -81,6 +81,7 @@ func (d *DockerDatabase) Ensure(ctx context.Context, env Environment) (int, erro
 			return port, nil
 		}
 	} else {
+		d.warnAboutBindMountData(env)
 		port = recorded
 		if port == 0 || !portAvailable(port) {
 			if port, err = firstAvailablePort(defaultPostgresPort); err != nil {
@@ -115,6 +116,18 @@ func (d *DockerDatabase) Ensure(ctx context.Context, env Environment) (int, erro
 			return 0, err
 		}
 	}
+}
+
+// warnAboutBindMountData points out data an older launcher kept in
+// tmp/postgres, which the container no longer mounts.
+func (d *DockerDatabase) warnAboutBindMountData(env Environment) {
+	old := filepath.Join(env.MainRoot, "tmp", "postgres")
+	if _, err := os.Stat(filepath.Join(old, "PG_VERSION")); err != nil {
+		return
+	}
+	d.printf("Warning: %s holds PostgreSQL data from before the container kept its data in a Docker volume. "+
+		"It isn't used anymore, so worktree databases start empty. See \"Upgrading from tmp/postgres\" in the README, "+
+		"then delete %s to stop this warning.\n", old, old)
 }
 
 // Stop stops the shared container. Its data stays in the Docker volume.
@@ -471,13 +484,13 @@ func withDatabase(ctx context.Context, env Environment, name string, work func(*
 	if err != nil {
 		return err
 	}
-	cfg := config.NewForTest()
-	cfg.AppEnv = config.EnvironmentDevelopment
-	cfg.DatabaseURL = DatabaseURL(port, name)
-	cfg.DatabaseDebug = false
-	cfg.DatabaseConnectRetryCount = 5
-	cfg.DatabaseConnectRetryDelay = 500 * time.Millisecond
-	db, err := database.New(ctx, cfg)
+	db, err := database.New(ctx, &config.Config{
+		DatabaseURL:               DatabaseURL(port, name),
+		DatabaseMaxOpenConns:      2,
+		DatabaseMaxIdleConns:      1,
+		DatabaseConnectRetryCount: 5,
+		DatabaseConnectRetryDelay: 500 * time.Millisecond,
+	})
 	if err != nil {
 		return fmt.Errorf("open database %s: %w", name, err)
 	}

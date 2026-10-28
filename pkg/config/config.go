@@ -168,16 +168,6 @@ func NewForTest() *Config {
 }
 
 func validateConfig(cfg *Config) error {
-	if strings.TrimSpace(cfg.DatabaseURL) == "" {
-		return errors.New("database_url: required")
-	}
-	if err := validateDatabaseURL(cfg.DatabaseURL); err != nil {
-		return err
-	}
-	if !validCookieNamespace(cfg.CookieNamespace) {
-		return errors.New("cookie_namespace: must be 64 characters or fewer and use lowercase letters, numbers, and underscores")
-	}
-
 	validate := validator.New()
 	validate.RegisterTagNameFunc(func(field reflect.StructField) string { return field.Tag.Get("koanf") })
 	if err := validate.Struct(cfg); err != nil {
@@ -187,6 +177,12 @@ func validateConfig(cfg *Config) error {
 		}
 		field := validationErrors[0]
 		return fmt.Errorf("%s: failed %s", field.Field(), strings.TrimSpace(field.Tag()+" "+field.Param()))
+	}
+	if err := validateDatabaseURL(cfg.DatabaseURL); err != nil {
+		return err
+	}
+	if !validCookieNamespace(cfg.CookieNamespace) {
+		return errors.New("cookie_namespace: must be 64 characters or fewer and use lowercase letters, numbers, and underscores")
 	}
 	return nil
 }

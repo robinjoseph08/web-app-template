@@ -38,6 +38,22 @@ A linked worktree's first database is a copy of the main worktree's when that ex
 
 Stop the shared container with `mise db:stop`. Its data is kept. Do not run `docker compose down -v`, which deletes every worktree's data.
 
+### Upgrading from tmp/postgres
+
+Older versions of this template kept PostgreSQL's data in the main worktree's `tmp/postgres` directory. The container no longer mounts it, so worktree databases start empty, and the launcher warns until the directory is gone. To keep a database, run `mise setup` first, then copy it from a temporary container that reads the old directory:
+
+```sh
+docker run --rm --detach --name old-postgres --env POSTGRES_PASSWORD=postgres \
+  --volume "$PWD/tmp/postgres:/var/lib/postgresql/data" postgres:17.6-alpine3.22
+until docker exec old-postgres pg_isready -U postgres; do sleep 1; done
+new=$(docker ps --filter "label=com.docker.compose.service=postgres" --format '{{.Names}}' | head -1)
+docker exec old-postgres pg_dump -U postgres --format=custom DATABASE |
+  docker exec -i "$new" pg_restore -U postgres --clean --if-exists --no-owner -d DATABASE
+docker stop old-postgres
+```
+
+Run it from the main worktree, replacing `DATABASE` with each database's name, and check that `docker ps` lists only this repository's PostgreSQL container. The database must already exist in the new container: `mise setup` creates the worktree's own, and `docker exec "$new" createdb -U postgres DATABASE` creates any other. Delete `tmp/postgres` afterward.
+
 ## Start development
 
 ```sh
@@ -143,7 +159,7 @@ Clone commands must run from a linked worktree. Replacing an existing database r
 
 ## Frontend
 
-Import from `app/` with the `@/` alias, like `import { App } from "@/App"`.
+Import across directories in `app/` with the `@/` alias, like `import { App } from "@/App"`. Files in the same directory import each other relatively.
 
 The theme follows the device's color scheme until the visitor picks one with the toggle. An inline script in `app/index.html` applies it before the page draws, so it doesn't flash light first. Colors are named for their role in `app/styles.css` (`bg-surface`, `text-ink`, `border-line`, and so on) and defined once per theme, so components rarely need `dark:` classes.
 

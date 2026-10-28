@@ -35,7 +35,8 @@ func New(tb testing.TB) *bun.DB {
 
 	baseURL := os.Getenv("TEST_DATABASE_URL")
 	if baseURL == "" {
-		if os.Getenv("CI") == "true" && os.Getenv("GITHUB_ACTIONS") == "true" {
+		// Not CI, which the mise test tasks set locally too.
+		if os.Getenv("GITHUB_ACTIONS") == "true" {
 			tb.Fatal("TEST_DATABASE_URL is required in CI")
 		}
 		var err error

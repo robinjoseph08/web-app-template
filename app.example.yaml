@@ -5,7 +5,8 @@
 # Environment variables take precedence over this file. The file may only
 # contain the settings below; anything else is rejected at startup.
 
-# production, development, or test.
+# production, development, or test. The template itself doesn't read it; it's
+# there for application code that needs to behave differently per environment.
 # Env: APP_ENV
 app_env: production
 
