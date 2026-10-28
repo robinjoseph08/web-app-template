@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"go/format"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -116,6 +117,14 @@ func planChanges(root string, files []string, project project) ([]fileChange, bo
 				markerFound = true
 				updated = strings.ReplaceAll(updated, marker, replacement.value(project))
 			}
+		}
+		// A new module path can sort differently among the other imports.
+		if strings.HasSuffix(relative, ".go") && updated != string(contents) {
+			formatted, err := format.Source([]byte(updated))
+			if err != nil {
+				return nil, false, fmt.Errorf("format %s: %w", relative, err)
+			}
+			updated = string(formatted)
 		}
 		if updated != string(contents) {
 			changes = append(changes, fileChange{
