@@ -46,7 +46,7 @@ func New() (*Binder, error) {
 
 	validate := validator.New()
 	validate.RegisterTagNameFunc(func(field reflect.StructField) string {
-		name := strings.SplitN(field.Tag.Get("json"), ",", 2)[0]
+		name, _, _ := strings.Cut(field.Tag.Get("json"), ",")
 		if name == "-" {
 			return ""
 		}
@@ -142,18 +142,23 @@ func (b *Binder) bindJSON(c *echo.Context, target any, disallowEmptyBody bool) e
 
 	var trailing any
 	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
+			return errcodes.RequestTooLarge()
+		}
 		return errcodes.MalformedPayload()
 	}
 	return nil
 }
 
 func decodeJSONError(err error) error {
+	if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
+		return errcodes.RequestTooLarge()
+	}
 	if matches := unknownFieldsRE.FindStringSubmatch(err.Error()); len(matches) == 2 {
 		return errcodes.UnknownParameter(matches[1])
 	}
 
-	var typeErr *json.UnmarshalTypeError
-	if errors.As(err, &typeErr) {
+	if typeErr, ok := errors.AsType[*json.UnmarshalTypeError](err); ok {
 		return errcodes.ValidationTypeError(formatUnmarshalTypeError(typeErr))
 	}
 
@@ -204,12 +209,10 @@ func (b *Binder) decode(target any, params url.Values, decoder *schema.Decoder) 
 			return err
 		}
 		for _, itemErr := range multiError {
-			var conversionErr schema.ConversionError
-			if errors.As(itemErr, &conversionErr) {
+			if conversionErr, ok := errors.AsType[schema.ConversionError](itemErr); ok {
 				return errcodes.ValidationTypeError(formatSchemaConversionError(conversionErr))
 			}
-			var unknownKeyErr schema.UnknownKeyError
-			if errors.As(itemErr, &unknownKeyErr) {
+			if unknownKeyErr, ok := errors.AsType[schema.UnknownKeyError](itemErr); ok {
 				return errcodes.UnknownParameter(unknownKeyErr.Key)
 			}
 			return itemErr

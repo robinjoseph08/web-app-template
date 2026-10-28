@@ -2,9 +2,11 @@ package server
 
 import (
 	"fmt"
+	"mime"
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/labstack/echo/v5"
@@ -16,7 +18,13 @@ import (
 	"github.com/robinjoseph08/web-app-template/pkg/binder"
 	"github.com/robinjoseph08/web-app-template/pkg/config"
 	"github.com/robinjoseph08/web-app-template/pkg/errcodes"
+	"github.com/robinjoseph08/web-app-template/pkg/errorstack"
+	"github.com/robinjoseph08/web-app-template/pkg/version"
 )
+
+// maxRequestBodyBytes caps API request bodies. JSON requests are small; raise
+// it, or exempt a route, if one needs to accept uploads.
+const maxRequestBodyBytes = 64 * 1024
 
 // New constructs the HTTP server and registers the application's routes and
 // middleware.
@@ -42,9 +50,16 @@ func newServer(cfg *config.Config, frontend http.Handler) (*http.Server, error) 
 
 	e.Use(echologger.Middleware())
 	e.Use(recovery.Middleware())
-	e.Use(middleware.CORS("*"))
+	e.Use(capturePanicErrorStack())
+	// The embedded frontend compresses its own files once at startup, so only
+	// API responses are compressed per request.
+	e.Use(middleware.GzipWithConfig(middleware.GzipConfig{
+		Skipper: func(c *echo.Context) bool { return !isAPI(c.Request()) },
+	}))
+	e.Use(browserAPI())
 
 	health.RegisterRoutes(e)
+	version.RegisterRoutes(e)
 	apiNotFound := func(_ *echo.Context) error { return echo.ErrNotFound }
 	e.Any("/api", apiNotFound)
 	e.Any("/api/*", apiNotFound)
@@ -61,4 +76,66 @@ func newServer(cfg *config.Config, frontend http.Handler) (*http.Server, error) 
 		Handler:           e,
 		ReadHeaderTimeout: 3 * time.Second,
 	}, nil
+}
+
+func isAPI(request *http.Request) bool {
+	return request.URL.Path == "/api" || strings.HasPrefix(request.URL.Path, "/api/")
+}
+
+// capturePanicErrorStack preserves the panic site before Golib's recovery
+// middleware converts an error panic into a returned error.
+func capturePanicErrorStack() echo.MiddlewareFunc {
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c *echo.Context) error {
+			defer func() {
+				recovered := recover()
+				if recovered == nil {
+					return
+				}
+				recoveredErr, ok := recovered.(error)
+				if !ok {
+					panic(recovered)
+				}
+				if recoveredErr == http.ErrAbortHandler { //nolint:errorlint // net/http requires the exact sentinel.
+					panic(recoveredErr)
+				}
+				panic(errorstack.Capture(recoveredErr))
+			}()
+			return next(c)
+		}
+	}
+}
+
+// browserAPI keeps API responses out of caches and rejects cross-site
+// mutations. The frontend is served from the same origin as the API (Vite
+// proxies /api in development), so it's never cross-origin. Mutations must
+// send JSON, which a plain HTML form can't, and are capped in size.
+func browserAPI() echo.MiddlewareFunc {
+	crossOrigin := http.NewCrossOriginProtection()
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c *echo.Context) error {
+			request := c.Request()
+			if !isAPI(request) {
+				return next(c)
+			}
+			header := c.Response().Header()
+			header.Set("Cache-Control", "no-store")
+			header.Set("X-Content-Type-Options", "nosniff")
+			switch request.Method {
+			case http.MethodGet, http.MethodHead, http.MethodOptions:
+				return next(c)
+			}
+			if err := crossOrigin.Check(request); err != nil {
+				return &errcodes.Error{HTTPCode: http.StatusForbidden, Message: "Cross-origin requests are not allowed.", Code: "invalid_origin"}
+			}
+			if request.ContentLength != 0 || request.Header.Get(echo.HeaderContentType) != "" {
+				contentType, _, err := mime.ParseMediaType(request.Header.Get(echo.HeaderContentType))
+				if err != nil || contentType != echo.MIMEApplicationJSON {
+					return errcodes.UnsupportedMediaType()
+				}
+			}
+			request.Body = http.MaxBytesReader(c.Response(), request.Body, maxRequestBodyBytes)
+			return next(c)
+		}
+	}
 }

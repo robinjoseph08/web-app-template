@@ -56,6 +56,11 @@ func MalformedPayload() error {
 	return &Error{http.StatusBadRequest, "Malformed Payload", "malformed_payload"}
 }
 
+// RequestTooLarge reports a request body over the server's size limit.
+func RequestTooLarge() error {
+	return &Error{http.StatusRequestEntityTooLarge, "Request body is too large.", "request_too_large"}
+}
+
 // EmptyRequestBody reports a missing body on a request that requires one.
 func EmptyRequestBody() error {
 	return &Error{http.StatusBadRequest, "Request body can't be empty.", "empty_request_body"}

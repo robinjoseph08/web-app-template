@@ -9,6 +9,7 @@ import (
 	"github.com/robinjoseph08/golib/logger"
 	"github.com/robinjoseph08/web-app-template/pkg/config"
 	"github.com/robinjoseph08/web-app-template/pkg/database"
+	"github.com/robinjoseph08/web-app-template/pkg/errorstack"
 	"github.com/robinjoseph08/web-app-template/pkg/migrations"
 	"github.com/uptrace/bun"
 	"github.com/uptrace/bun/migrate"
@@ -117,13 +118,13 @@ func withDatabase(action func(*cli.Context, *bun.DB) error) cli.ActionFunc {
 			return fmt.Errorf("load config: %w", err)
 		}
 
-		db, err := database.New(cfg)
+		db, err := database.New(c.Context, cfg)
 		if err != nil {
 			return fmt.Errorf("open database: %w", err)
 		}
 		defer func() {
 			if closeErr := db.Close(); closeErr != nil {
-				returnErr = errors.Join(returnErr, fmt.Errorf("close database: %w", closeErr))
+				returnErr = errors.Join(returnErr, fmt.Errorf("close database: %w", errorstack.Capture(closeErr)))
 			}
 		}()
 

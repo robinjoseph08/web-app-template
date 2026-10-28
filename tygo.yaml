@@ -1,11 +1,11 @@
-# Tygo treats an empty package list as the current directory, so keep a
-# placeholder package until there are Go types that the frontend needs.
+# Generates TypeScript types from the Go types the frontend uses. Add each
+# package's types.go here as it gains request or response types.
 type_mappings:
   time.Time: "string /* RFC3339 */"
   time.Duration: "number /* nanoseconds */"
 
 packages:
-  - path: "github.com/robinjoseph08/web-app-template/pkg/config"
-    output_path: "app/types/generated/stub.ts"
+  - path: "github.com/robinjoseph08/web-app-template/pkg/version"
+    output_path: "app/types/generated/version.ts"
     include_files:
-      - "__tygo_stub__.go"
+      - "types.go"

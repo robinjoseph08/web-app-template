@@ -12,6 +12,7 @@ import (
 	"github.com/robinjoseph08/golib/signals"
 	"github.com/robinjoseph08/web-app-template/pkg/config"
 	"github.com/robinjoseph08/web-app-template/pkg/database"
+	"github.com/robinjoseph08/web-app-template/pkg/errorstack"
 	"github.com/robinjoseph08/web-app-template/pkg/migrations"
 	"github.com/robinjoseph08/web-app-template/pkg/server"
 	"github.com/robinjoseph08/web-app-template/pkg/version"
@@ -23,6 +24,11 @@ const (
 )
 
 func main() {
+	// Logs are JSON on stdout unless LOG_FORMAT says otherwise, which is what
+	// container log collectors expect. The dev launcher asks for console logs.
+	if os.Getenv("LOG_FORMAT") == "" {
+		logger.SetOutput(os.Stdout)
+	}
 	log := logger.New()
 	if err := run(log); err != nil {
 		log.Err(err).Fatal("application stopped")
@@ -38,13 +44,13 @@ func run(log logger.Logger) error {
 		return fmt.Errorf("load config: %w", err)
 	}
 
-	db, err := database.New(cfg)
+	db, err := database.New(ctx, cfg)
 	if err != nil {
 		return fmt.Errorf("open database: %w", err)
 	}
 	defer func() {
 		if closeErr := db.Close(); closeErr != nil {
-			log.Err(closeErr).Error("database close error")
+			log.Err(errorstack.Capture(closeErr)).Error("database close error")
 		}
 	}()
 
@@ -77,7 +83,7 @@ func run(log logger.Logger) error {
 		if errors.Is(err, http.ErrServerClosed) {
 			return nil
 		}
-		return fmt.Errorf("serve HTTP: %w", err)
+		return fmt.Errorf("serve HTTP: %w", errorstack.Capture(err))
 	case <-signals.Setup():
 		log.Info("starting graceful shutdown")
 	}
@@ -91,9 +97,9 @@ func run(log logger.Logger) error {
 	shutdownCtx, cancel := context.WithTimeout(ctx, serverShutdownTimeout)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		log.Err(err).Error("server shutdown error")
+		log.Err(errorstack.Capture(err)).Error("server shutdown error")
 		if closeErr := srv.Close(); closeErr != nil {
-			log.Err(closeErr).Error("server force-close error")
+			log.Err(errorstack.Capture(closeErr)).Error("server force-close error")
 		}
 	}
 

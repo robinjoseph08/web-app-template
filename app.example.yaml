@@ -2,11 +2,26 @@
 #
 # Copy this file to /config/app.yaml, or set CONFIG_FILE to another path.
 # Every setting can also be set with its uppercase environment variable.
-# Environment variables take precedence over this file.
+# Environment variables take precedence over this file. The file may only
+# contain the settings below; anything else is rejected at startup.
+
+# production, development, or test.
+# Env: APP_ENV
+app_env: production
+
+# Prefix for the names of the cookies the application sets. Lowercase
+# letters, numbers, and underscores, up to 64 characters.
+# Env: COOKIE_NAMESPACE
+cookie_namespace: web_app_template
 
 # PostgreSQL connection URL.
 # Env: DATABASE_URL
 database_url: postgres://app:change-me@postgres:5432/web_app_template?sslmode=disable
+
+# Connection pool limits. Idle connections can't exceed open connections.
+# Env: DATABASE_MAX_OPEN_CONNS, DATABASE_MAX_IDLE_CONNS
+database_max_open_conns: 10
+database_max_idle_conns: 3
 
 # Log SQL queries for contexts wrapped with database.WithLogging.
 # Env: DATABASE_DEBUG
@@ -19,10 +34,6 @@ database_connect_retry_count: 5
 # Delay between connection attempts.
 # Env: DATABASE_CONNECT_RETRY_DELAY
 database_connect_retry_delay: 2s
-
-# Directory used for application-managed files.
-# Env: FILES_PATH
-files_path: /data/files
 
 # HTTP listener address.
 # Env: SERVER_HOST

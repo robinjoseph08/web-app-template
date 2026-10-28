@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -28,8 +29,6 @@ func TestHandlerResponses(t *testing.T) {
 	}
 
 	for name, test := range tests {
-		name := name
-		test := test
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			e := echo.New()
@@ -75,10 +74,26 @@ func TestHandlerIgnoresCanceledRequests(t *testing.T) {
 
 	e := echo.New()
 	e.HTTPErrorHandler = NewHandler().Handle
+	e.GET("/", func(c *echo.Context) error { return fmt.Errorf("load records: %w", c.Request().Context().Err()) })
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	recorder := httptest.NewRecorder()
+	e.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil).WithContext(ctx))
+
+	assert.Equal(t, http.StatusOK, recorder.Code)
+	assert.Empty(t, recorder.Body.String())
+}
+
+// A cancellation that isn't the request's own, like an upstream call's
+// timeout, is a server error.
+func TestHandlerReportsCancellationsFromElsewhere(t *testing.T) {
+	t.Parallel()
+
+	e := echo.New()
+	e.HTTPErrorHandler = NewHandler().Handle
 	e.GET("/", func(_ *echo.Context) error { return context.Canceled })
 	recorder := httptest.NewRecorder()
 	e.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
 
-	assert.Equal(t, http.StatusOK, recorder.Code)
-	assert.Empty(t, recorder.Body.String())
+	assert.Equal(t, http.StatusInternalServerError, recorder.Code)
 }
