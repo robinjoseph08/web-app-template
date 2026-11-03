@@ -46,7 +46,7 @@ jobs:
           path: |
             ~/.cache/go-build
             ~/go/pkg/mod
-            tmp/golangci-lint-cache
+            ~/.cache/golangci-lint
           key: go-${{ env.ImageOS }}-${{ hashFiles('mise.toml', 'go.sum') }}
           restore-keys: go-${{ env.ImageOS }}-
       - run: mise lint:go
