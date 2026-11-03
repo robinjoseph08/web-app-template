@@ -1,4 +1,8 @@
 version: "2"
+run:
+  # Skip the lock in the system temp directory, which every project on the
+  # machine shares, so another project's lint can't fail or block this one.
+  allow-parallel-runners: true
 linters:
   default: none
   enable:
