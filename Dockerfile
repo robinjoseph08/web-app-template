@@ -12,7 +12,7 @@ RUN sed -n 's/^"npm:pnpm" = "\(.*\)"$/\1/p' /mise.toml > /pnpm-version && \
     sed -n 's/^"github:gzuidhof\/tygo" = "\(.*\)"$/\1/p' /mise.toml > /tygo-version && \
     test -s /pnpm-version && test -s /tygo-version
 
-FROM --platform=$BUILDPLATFORM golang:1.27.0-alpine@sha256:4c9fe60190a2a3350ddc51de80d0224b8a6698d12bdfc999fee45ea9d6c46dbc AS typegen
+FROM --platform=$BUILDPLATFORM golang:1.27.3-alpine@sha256:d200d2dd76b03a99b52651fd1325aff7dcd35422c35c01bac56571b0507f3deb AS typegen
 WORKDIR /src
 COPY --from=tool-versions /tygo-version /tmp/tygo-version
 RUN go install "github.com/gzuidhof/tygo@v$(cat /tmp/tygo-version)"
@@ -31,7 +31,7 @@ COPY tsconfig*.json vite.config.ts ./
 COPY --from=typegen /src/app/types/generated ./app/types/generated
 RUN pnpm build
 
-FROM --platform=$BUILDPLATFORM golang:1.27.0-alpine@sha256:4c9fe60190a2a3350ddc51de80d0224b8a6698d12bdfc999fee45ea9d6c46dbc AS backend
+FROM --platform=$BUILDPLATFORM golang:1.27.3-alpine@sha256:d200d2dd76b03a99b52651fd1325aff7dcd35422c35c01bac56571b0507f3deb AS backend
 ARG TARGETOS
 ARG TARGETARCH
 ARG VERSION=dev
