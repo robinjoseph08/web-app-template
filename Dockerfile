@@ -20,7 +20,7 @@ COPY go.mod go.sum tygo.yaml ./
 COPY pkg ./pkg
 RUN tygo generate
 
-FROM --platform=$BUILDPLATFORM node:26.8.1-alpine@sha256:2d984a15c9b54fd0aeb608b8e0d0d83529eb34d2966db27a1fb4f1edc3d298a3 AS frontend
+FROM --platform=$BUILDPLATFORM node:26.13.0-alpine@sha256:c6ad9e9c1d80f6eb607c26b4b0a132ff7a2344fad1c78ea3baa2a7d4c8de6d94 AS frontend
 WORKDIR /src
 COPY --from=tool-versions /pnpm-version /tmp/pnpm-version
 RUN npm install --global "pnpm@$(cat /tmp/pnpm-version)"
