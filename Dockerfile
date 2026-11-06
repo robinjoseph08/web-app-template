@@ -6,7 +6,7 @@
 # The pnpm and tygo versions pinned in mise.toml, so local and image builds
 # match. They're read in their own stage so other edits to mise.toml don't
 # redo the dependency installs below.
-FROM --platform=$BUILDPLATFORM alpine:3.24.2@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6 AS tool-versions
+FROM --platform=$BUILDPLATFORM alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a AS tool-versions
 COPY mise.toml /
 RUN sed -n 's/^"npm:pnpm" = "\(.*\)"$/\1/p' /mise.toml > /pnpm-version && \
     sed -n 's/^"github:gzuidhof\/tygo" = "\(.*\)"$/\1/p' /mise.toml > /tygo-version && \
@@ -48,7 +48,7 @@ RUN MODULE=$(go list -m) && \
       -ldflags "-w -s -X $MODULE/pkg/version.Version=$VERSION" \
       -o /out/app ./cmd/api
 
-FROM alpine:3.24.2@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
+FROM alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
 RUN apk add --no-cache ca-certificates tzdata && \
     addgroup -S app && adduser -S -G app app && \
     mkdir -p /config && chown -R app:app /config
