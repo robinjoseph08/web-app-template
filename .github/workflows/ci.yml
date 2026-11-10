@@ -38,7 +38,7 @@ jobs:
       TEST_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/web_app_template_test?sslmode=disable
     steps:
       - uses: actions/checkout@v7
-      - uses: jdx/mise-action@v4
+      - uses: jdx/mise-action@v5
         with:
           install_args: go github:golangci/golangci-lint
       - uses: actions/cache@v6
@@ -58,7 +58,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
-      - uses: jdx/mise-action@v4
+      - uses: jdx/mise-action@v5
         with:
           install_args: go node npm:pnpm github:gzuidhof/tygo
       - uses: actions/cache@v6
@@ -79,7 +79,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
-      - uses: jdx/mise-action@v4
+      - uses: jdx/mise-action@v5
         with:
           install_args: go node npm:pnpm github:gzuidhof/tygo
       - uses: actions/cache@v6
@@ -175,7 +175,7 @@ jobs:
           --health-retries 30
     steps:
       - uses: actions/checkout@v7
-      - uses: jdx/mise-action@v4
+      - uses: jdx/mise-action@v5
         with:
           install_args: go node npm:pnpm github:gzuidhof/tygo
       - uses: actions/cache@v6
